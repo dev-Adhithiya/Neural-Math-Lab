@@ -1,4 +1,5 @@
 import React from 'react';
+import { getTopic } from '../agents/KnowledgeGraph.js';
 
 /**
  * MarksDashboard — Displays grading results and step-by-step breakdown.
@@ -39,6 +40,8 @@ export default function MarksDashboard({ gradingResult, examHistory = [] }) {
     return icons[status] || '•';
   };
 
+  const percentage = Number(gradingResult?.percentage || 0);
+
   return (
     <div className="marks-dashboard">
       {gradingResult && (
@@ -52,13 +55,13 @@ export default function MarksDashboard({ gradingResult, examHistory = [] }) {
                 className="score-fill"
                 style={{
                   strokeDasharray: `${2 * Math.PI * 52}`,
-                  strokeDashoffset: `${2 * Math.PI * 52 * (1 - gradingResult.percentage / 100)}`,
-                  stroke: gradingResult.percentage >= 70 ? '#10b981' : gradingResult.percentage >= 50 ? '#f59e0b' : '#ef4444',
+                  strokeDashoffset: `${2 * Math.PI * 52 * (1 - percentage / 100)}`,
+                  stroke: percentage >= 70 ? '#10b981' : percentage >= 50 ? '#f59e0b' : '#ef4444',
                 }}
               />
             </svg>
             <div className="score-text">
-              <span className="score-number">{gradingResult.percentage}%</span>
+              <span className="score-number">{percentage}%</span>
               <span className="score-label">{gradingResult.score}/{gradingResult.maxScore}</span>
               <span className="score-grade">{gradingResult.grade}</span>
             </div>
@@ -67,7 +70,7 @@ export default function MarksDashboard({ gradingResult, examHistory = [] }) {
           {/* Step Results */}
           <div className="step-results">
             <h4>Step-by-Step Breakdown</h4>
-            {gradingResult.stepResults.map((step) => (
+            {(Array.isArray(gradingResult.stepResults) ? gradingResult.stepResults : []).map((step) => (
               <div
                 key={step.stepNumber}
                 className="step-result-item"
@@ -99,14 +102,14 @@ export default function MarksDashboard({ gradingResult, examHistory = [] }) {
           <div className="history-list">
             {examHistory.slice(0, 5).map((exam, i) => (
               <div key={i} className="history-item">
-                <span className="history-topic">{exam.topicId}</span>
+                <span className="history-topic">{getTopic(exam.topicId)?.label || exam.topicId}</span>
                 <span className="history-score">{exam.score}/{exam.maxScore}</span>
                 <div className="history-bar">
                   <div
                     className="history-fill"
                     style={{
-                      width: `${(exam.score / exam.maxScore) * 100}%`,
-                      backgroundColor: exam.score / exam.maxScore >= 0.7 ? '#10b981' : '#f59e0b',
+                      width: `${exam.maxScore > 0 ? (exam.score / exam.maxScore) * 100 : 0}%`,
+                      backgroundColor: exam.maxScore > 0 && exam.score / exam.maxScore >= 0.7 ? '#10b981' : '#f59e0b',
                     }}
                   />
                 </div>

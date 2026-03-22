@@ -19,16 +19,72 @@ import { gradeWork } from '../agents/GraderAgent.js';
 import { getAnnotatedTopics, buildProgressMap } from '../agents/KnowledgeGraph.js';
 import { generateSessionPlan, planToMessage } from '../agents/ProactivePlanner.js';
 import { generateReport } from '../agents/StudentReportGenerator.js';
-import { calculateLevel, awardParticipation, getCurrentLevel } from '../engine/GamificationEngine.js';
+import { calculateLevel, awardParticipation, awardStepByStep, getCurrentLevel } from '../engine/GamificationEngine.js';
 import { plotMathFunction, extractGraphCommands } from '../engine/DynamicGraphing.js';
+import { simplify } from 'mathjs';
 import { processHandwriting } from '../vision/VisionModule.js';
 import { extractMathWithMoondream, preprocessForOcr, bridgeToPhi3, classifyImageWithMoondream } from '../vision/ImageDispatcher.js';
 import { TOPICS, getTopic, getPrerequisiteChain } from '../agents/KnowledgeGraph.js';
 import {
   getProfile, getPrerequisiteProgress, getExamHistory,
-  saveChatMessage, getMistakes,
+  saveChatMessage, getMistakes, saveExamResult,
   createChatSession, getChatSessions, getChatHistory, deleteChatSession, updateSessionTimestamp, updateSessionTitle,
+  resetAllData,
 } from '../store/localVault.js';
+
+function normalizeMathAnswer(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\$+/g, '')
+    .replace(/\s+/g, '')
+    .replace(/×/g, '*')
+    .replace(/−/g, '-')
+    .replace(/\^\{([^}]+)\}/g, '^$1');
+}
+
+function areMathAnswersEquivalent(studentAnswer, expectedAnswer) {
+  const student = normalizeMathAnswer(studentAnswer);
+  const expected = normalizeMathAnswer(expectedAnswer);
+  if (!student || !expected) return false;
+  if (student === expected) return true;
+
+  try {
+    const diff = simplify(`(${student})-(${expected})`);
+    const simplifiedDiff = normalizeMathAnswer(diff.toString());
+    if (simplifiedDiff === '0') return true;
+
+    const compiled = diff.compile();
+    const sampleXs = [-3, -1, 0, 1, 2, 4];
+    const allCloseToZero = sampleXs.every((x) => {
+      const v = Number(compiled.evaluate({ x }));
+      return Number.isFinite(v) && Math.abs(v) < 1e-8;
+    });
+    return allCloseToZero;
+  } catch {
+    return false;
+  }
+}
+
+function getTopTopicsFromHistory(exams = []) {
+  const map = new Map();
+  for (const e of exams || []) {
+    if (!e?.topicId || !e?.maxScore) continue;
+    const item = map.get(e.topicId) || { topicId: e.topicId, score: 0, maxScore: 0, attempts: 0 };
+    item.score += Number(e.score || 0);
+    item.maxScore += Number(e.maxScore || 0);
+    item.attempts += 1;
+    map.set(e.topicId, item);
+  }
+
+  return [...map.values()]
+    .map((x) => ({ ...x, accuracy: x.maxScore > 0 ? Math.round((x.score / x.maxScore) * 100) : 0 }))
+    .sort((a, b) => b.attempts - a.attempts)
+    .slice(0, 4);
+}
+
+function isEphemeralSessionId(id) {
+  return typeof id === 'string' && id.startsWith('local-');
+}
 
 /**
  * MathWorkspace — Main application workspace.
@@ -40,7 +96,7 @@ export default function MathWorkspace() {
   // ── State ──
   const [messages, setMessages] = useState([]);
   const [streamingText, setStreamingText] = useState('');
-  const [tutorMode, setTutorMode] = useState('TEACHING');
+  const [tutorMode, setTutorMode] = useState('GREETING'); // Start in GREETING mode, not TEACHING
   const [selectedTopic, setSelectedTopic] = useState(null);
   const [annotatedTopics, setAnnotatedTopics] = useState([]);
   const [levelInfo, setLevelInfo] = useState(null);
@@ -56,9 +112,12 @@ export default function MathWorkspace() {
   const [activeView, setActiveView] = useState('chat'); // chat | quiz | plan | prereq | report | map | mistakes
   const [chatSessions, setChatSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
+  const [ephemeralMessagesBySession, setEphemeralMessagesBySession] = useState({});
+  const [isEphemeralMode, setIsEphemeralMode] = useState(false);
   const [prereqTopicId, setPrereqTopicId] = useState('polynomials');
   const [toast, setToast] = useState('');
   const [isTutorReady, setIsTutorReady] = useState(false);
+  const [sidePrompt, setSidePrompt] = useState('');
 
   const showToast = useCallback((message, duration = 4600) => {
     setToast(message);
@@ -66,9 +125,24 @@ export default function MathWorkspace() {
       setTimeout(() => setToast(''), duration);
     }
   }, []);
+  const switchToEphemeralMode = useCallback((reason = null) => {
+    const localId = `local-main`;
+    setIsEphemeralMode(true);
+    setChatSessions((prev) => {
+      const existingLocal = prev.find((s) => String(s.id) === localId);
+      if (existingLocal) return prev;
+      return [{ id: localId, title: 'Local Chat', createdAt: new Date().toISOString() }, ...prev.filter((s) => !isEphemeralSessionId(s.id))];
+    });
+    setActiveSessionId(localId);
+    if (reason) {
+      showToast('⚠️ Browser storage is unavailable. Switched to temporary chat mode (data will not persist).', 7600);
+      console.warn('[MathWorkspace] Ephemeral mode reason:', reason);
+    }
+  }, [showToast]);
 
   // ── AI Hook ──
   const { mode: aiMode, setMode: setAIModeInternal, isStreaming, streamChat, analyzeImage, routeBadge, abort } = useAI(settings);
+  const topTopics = React.useMemo(() => getTopTopicsFromHistory(examHistory), [examHistory]);
 
   const setAIMode = useCallback((nextMode) => {
     setAIModeInternal(nextMode);
@@ -88,6 +162,19 @@ export default function MathWorkspace() {
   useEffect(() => {
     async function init() {
       let profileLoaded = false;
+
+      // One-time fresh session support (use ?fresh=true to clear all stored data)
+      try {
+        const query = (typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null);
+        const isFresh = query?.get('fresh') === 'true' || query?.get('reset') === 'true';
+        if (isFresh) {
+          await resetAllData();
+          await updateSettings({ aiMode: 'offline' });
+          showToast('✅ Fresh start: cleared cache + switched to offline AI mode', 7000);
+        }
+      } catch (freshErr) {
+        console.warn('⚠️ Fresh-start init failed:', freshErr);
+      }
 
       try {
         await getProfile();
@@ -113,57 +200,129 @@ export default function MathWorkspace() {
           tutorRef.current.resetConversation?.();
           tutorRef.current.setConversationHistory?.(restored);
         }
+      } catch (error) {
+        console.error('❌ Failed to initialize persistent chat store:', error);
+        switchToEphemeralMode(error?.message || 'init chat store failed');
+        setMessages([]);
+        if (tutorRef.current) {
+          tutorRef.current.resetConversation?.();
+          tutorRef.current.setConversationHistory?.([]);
+        }
+      }
 
+      try {
         const progress = await getPrerequisiteProgress();
         const progressMap = buildProgressMap(progress);
         setAnnotatedTopics(getAnnotatedTopics(progressMap));
+      } catch (error) {
+        console.warn('⚠️ Failed to load prerequisite progress:', error);
+        setAnnotatedTopics(getAnnotatedTopics(buildProgressMap([])));
+      }
 
+      try {
         const level = await getCurrentLevel();
         setLevelInfo(level);
-
-        const examRows = await getExamHistory();
-        setExamHistory(examRows.slice(0, 10));
-
-        // DO NOT auto-generate plan on startup
-        // User must explicitly ask for a plan by clicking a button
-
-        if (!profileLoaded) {
-          showToast('⚠️ Could not load profile data; running with defaults. Please check browser IndexedDB settings.');
-        }
       } catch (error) {
-        console.error('❌ Failed to initialize app data:', error);
-        showToast('⚠️ Some data failed to load. Chat and progress may not persist in this session.');
+        console.warn('⚠️ Failed to load level info:', error);
+        setLevelInfo(calculateLevel(0));
+      }
+
+      try {
+        const examRows = await getExamHistory();
+        setExamHistory((examRows || []).slice(0, 10));
+      } catch (error) {
+        console.warn('⚠️ Failed to load exam history:', error);
+        setExamHistory([]);
+      }
+
+      if (!profileLoaded) {
+        showToast('⚠️ Profile storage unavailable. Running with defaults in temporary mode.', 7000);
       }
     }
     init();
-  }, []);
+  }, [showToast, switchToEphemeralMode]);
 
   // Load chat history when session changes
   useEffect(() => {
     if (!activeSessionId) return;
-    (async () => {
-      const chatHistoryRows = await getChatHistory(activeSessionId);
-      const restored = (chatHistoryRows || []).map((m) => ({ role: m.role, content: m.content, id: m.id || `${m.timestamp}-${Math.random()}` }));
+
+    if (isEphemeralMode || isEphemeralSessionId(activeSessionId)) {
+      const restored = ephemeralMessagesBySession[activeSessionId] || [];
       setMessages(restored);
       tutorRef.current?.resetConversation?.();
       tutorRef.current?.setConversationHistory?.(restored);
+      return;
+    }
+
+    (async () => {
+      try {
+        const chatHistoryRows = await getChatHistory(activeSessionId);
+        const restored = (chatHistoryRows || []).map((m) => ({ role: m.role, content: m.content, id: m.id || `${m.timestamp}-${Math.random()}` }));
+        setMessages(restored);
+        tutorRef.current?.resetConversation?.();
+        tutorRef.current?.setConversationHistory?.(restored);
+      } catch (error) {
+        console.warn('⚠️ Failed to restore chat history:', error);
+        switchToEphemeralMode(error?.message || 'restore chat history failed');
+      }
     })();
-  }, [activeSessionId]);
+  }, [activeSessionId, ephemeralMessagesBySession, isEphemeralMode, switchToEphemeralMode]);
+
+  useEffect(() => {
+    if (!activeSessionId || !isEphemeralSessionId(activeSessionId)) return;
+    setEphemeralMessagesBySession((prev) => ({ ...prev, [activeSessionId]: messages }));
+  }, [messages, activeSessionId]);
 
   // ── Refresh topics and level ──
   const refreshData = useCallback(async () => {
-    const progress = await getPrerequisiteProgress();
-    const progressMap = buildProgressMap(progress);
-    setAnnotatedTopics(getAnnotatedTopics(progressMap));
-    const level = await getCurrentLevel();
-    setLevelInfo(level);
-    const examRows = await getExamHistory();
-    setExamHistory(examRows.slice(0, 10));
+    try {
+      const progress = await getPrerequisiteProgress();
+      const progressMap = buildProgressMap(progress);
+      setAnnotatedTopics(getAnnotatedTopics(progressMap));
+    } catch {
+      setAnnotatedTopics(getAnnotatedTopics(buildProgressMap([])));
+    }
+
+    try {
+      const level = await getCurrentLevel();
+      setLevelInfo(level);
+    } catch {
+      setLevelInfo(calculateLevel(0));
+    }
+
+    try {
+      const examRows = await getExamHistory();
+      setExamHistory((examRows || []).slice(0, 10));
+    } catch {
+      setExamHistory([]);
+    }
   }, []);
 
   // ── Send message ──
   const handleSend = useCallback(async (text) => {
     const trimmed = String(text || '').trim();
+    if (!trimmed) return;
+
+    if (!tutorRef.current || !isTutorReady) {
+      showToast('Tutor is still initializing. Please retry in a second.');
+      setMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: '⏳ Tutor is still initializing. Please send that again in a moment.',
+        id: Date.now() + 1,
+      }]);
+      return;
+    }
+
+    if (aiMode === 'online' && (!settings.azureEndpoint || !settings.azureKey || !settings.azureDeployment)) {
+      showToast('Online mode is missing Azure settings. Switched to Local mode.', 6000);
+      setAIMode('offline');
+      setMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: '⚠️ Online mode needs Azure endpoint/key/deployment in Settings. I switched to Local mode so chat can continue.',
+        id: Date.now() + 1,
+      }]);
+    }
+
     const isGreetingOnly = /^(hi|hello|hey|good (morning|afternoon|evening|night))[\s!.]*$/i.test(trimmed);
     if (messages.length === 0 && isGreetingOnly) {
       const now = new Date();
@@ -175,37 +334,61 @@ export default function MathWorkspace() {
         id: Date.now() + 1,
       };
       setMessages((prev) => [...prev, { role: 'user', content: trimmed, id: Date.now() }, assistantMsg]);
-      if (activeSessionId) {
-        await saveChatMessage({ role: 'user', content: trimmed, sessionId: activeSessionId });
-        await saveChatMessage({ role: 'assistant', content: assistantMsg.content, sessionId: activeSessionId });
-        await updateSessionTimestamp(activeSessionId);
+      if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
+        try {
+          await saveChatMessage({ role: 'user', content: trimmed, sessionId: activeSessionId });
+          await saveChatMessage({ role: 'assistant', content: assistantMsg.content, sessionId: activeSessionId });
+          await updateSessionTimestamp(activeSessionId);
+        } catch {
+          switchToEphemeralMode('saving greeting exchange failed');
+        }
       }
       return;
     }
 
-    const userMsg = { role: 'user', content: text, id: Date.now() };
+    const userMsg = { role: 'user', content: trimmed, id: Date.now() };
     setMessages((prev) => [...prev, userMsg]);
     setStreamingText('');
 
-    if (activeSessionId) {
-      await saveChatMessage({ role: 'user', content: text, sessionId: activeSessionId });
-      await updateSessionTimestamp(activeSessionId);
+    if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
+      try {
+        await saveChatMessage({ role: 'user', content: trimmed, sessionId: activeSessionId });
+        await updateSessionTimestamp(activeSessionId);
+      } catch {
+        switchToEphemeralMode('saving user message failed');
+      }
     }
 
-    const mistakes = await getMistakes();
+    let mistakes = [];
+    try {
+      mistakes = await getMistakes();
+    } catch {
+      mistakes = [];
+      switchToEphemeralMode('loading mistakes failed');
+    }
 
     try {
-      await tutorRef.current.chat(text, {
+      await tutorRef.current.chat(trimmed, {
         studentName: settings.studentName || 'Student',
         topicId: selectedTopic,
         previousMistakes: mistakes.slice(-5),
         gradingResult,
+        aiMode,
       }, {
         onToken: (token) => {
           setStreamingText((prev) => prev + token);
         },
         onDone: async (fullText) => {
           const assistantMsg = { role: 'assistant', content: fullText, id: Date.now() + 1 };
+
+          // Sync the tutorMode with the TutorAgent's internal mode
+          if (tutorRef.current) {
+            const agentState = tutorRef.current.getState();
+            setTutorMode(agentState.mode);
+            if (agentState.currentTopic && !selectedTopic) {
+              setSelectedTopic(agentState.currentTopic);
+            }
+          }
 
           // Check for graphs
           const graphEqs = extractGraphCommands(fullText);
@@ -215,19 +398,31 @@ export default function MathWorkspace() {
             setChartEquation(graphEqs[0]);
           }
 
-          // Award participation XP
-          const xpResult = await awardParticipation();
-          if (xpResult.leveledUp) {
-            assistantMsg.xpAward = xpResult;
+          // Award participation XP (best-effort only in temporary mode)
+          try {
+            const xpResult = await awardParticipation();
+            if (xpResult.leveledUp) {
+              assistantMsg.xpAward = xpResult;
+            }
+          } catch {
+            switchToEphemeralMode('awarding participation XP failed');
           }
 
           setMessages((prev) => [...prev, assistantMsg]);
           setStreamingText('');
-          if (activeSessionId) {
-            await saveChatMessage({ role: 'assistant', content: fullText, sessionId: activeSessionId });
-            await updateSessionTimestamp(activeSessionId);
+          if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
+            try {
+              await saveChatMessage({ role: 'assistant', content: fullText, sessionId: activeSessionId });
+              await updateSessionTimestamp(activeSessionId);
+            } catch {
+              switchToEphemeralMode('saving assistant message failed');
+            }
           }
-          refreshData();
+          try {
+            await refreshData();
+          } catch {
+            // Non-blocking refresh failure
+          }
         },
         onError: (err) => {
           const msg = String(err?.message || '');
@@ -257,8 +452,14 @@ export default function MathWorkspace() {
       });
     } catch (err) {
       console.error('[MathWorkspace] Error:', err);
+      setMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: `⚠️ I hit an unexpected error: ${err?.message || 'unknown error'}. Please try again.`,
+        id: Date.now() + 1,
+      }]);
+      showToast(`Unexpected chat error: ${err?.message || 'unknown error'}`, 7000);
     }
-  }, [settings.studentName, selectedTopic, gradingResult, refreshData, activeSessionId, messages.length]);
+  }, [settings.studentName, settings.azureEndpoint, settings.azureKey, settings.azureDeployment, selectedTopic, gradingResult, refreshData, activeSessionId, messages.length, aiMode, isTutorReady, setAIMode, showToast, isEphemeralMode, switchToEphemeralMode]);
 
   // ── Quick Actions ──
   const handleQuickAction = useCallback(async (actionId) => {
@@ -363,21 +564,31 @@ export default function MathWorkspace() {
         fullPrompt = `[Note: I couldn't read the image clearly. Please describe what you wrote or type out the problem]\n\n${trimmed || ''}`;
       }
       
-      if (activeSessionId) {
+      if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
          const savedMsg = trimmed ? `${trimmed}\n\n[Image submitted]` : `[Image submitted]`;
-         await saveChatMessage({ role: 'user', content: savedMsg, sessionId: activeSessionId });
-         await updateSessionTimestamp(activeSessionId);
+         try {
+           await saveChatMessage({ role: 'user', content: savedMsg, sessionId: activeSessionId });
+           await updateSessionTimestamp(activeSessionId);
+         } catch {
+           switchToEphemeralMode('saving image submission failed');
+         }
       }
       
       setStreamingText(''); // prepare for actual stream
       
-      const mistakes = await getMistakes();
+      let mistakes = [];
+      try {
+        mistakes = await getMistakes();
+      } catch {
+        mistakes = [];
+      }
       
       await tutorRef.current.chat(fullPrompt, {
         studentName: settings.studentName || 'Student',
         topicId: selectedTopic,
         previousMistakes: mistakes.slice(-5),
         gradingResult,
+        aiMode,
       }, {
         onToken: (token) => {
           setStreamingText((prev) => prev + token);
@@ -392,18 +603,30 @@ export default function MathWorkspace() {
             setChartEquation(graphEqs[0]);
           }
 
-          const xpResult = await awardParticipation();
-          if (xpResult.leveledUp) {
-            assistantMsg.xpAward = xpResult;
+          try {
+            const xpResult = await awardParticipation();
+            if (xpResult.leveledUp) {
+              assistantMsg.xpAward = xpResult;
+            }
+          } catch {
+            switchToEphemeralMode('awarding image-chat participation XP failed');
           }
 
           setMessages((prev) => [...prev, assistantMsg]);
           setStreamingText('');
-          if (activeSessionId) {
-            await saveChatMessage({ role: 'assistant', content: fullText, sessionId: activeSessionId });
-            await updateSessionTimestamp(activeSessionId);
+          if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
+            try {
+              await saveChatMessage({ role: 'assistant', content: fullText, sessionId: activeSessionId });
+              await updateSessionTimestamp(activeSessionId);
+            } catch {
+              switchToEphemeralMode('saving image assistant response failed');
+            }
           }
-          refreshData();
+          try {
+            await refreshData();
+          } catch {
+            // Non-blocking refresh failure
+          }
         },
         onError: (err) => {
           setStreamingText('');
@@ -427,7 +650,7 @@ export default function MathWorkspace() {
     } finally {
       setIsProcessingImage(false);
     }
-  }, [analyzeImage, settings.aiMode, settings.ollamaUrl, activeSessionId, selectedTopic, gradingResult, refreshData]);
+  }, [analyzeImage, settings.aiMode, settings.ollamaUrl, activeSessionId, selectedTopic, gradingResult, refreshData, aiMode, isEphemeralMode, switchToEphemeralMode]);
 
   // ── Topic Selection ──
   const handleTopicSelect = useCallback((topicId) => {
@@ -457,9 +680,18 @@ export default function MathWorkspace() {
           sessions={chatSessions}
           activeSessionId={activeSessionId}
           onNewSession={async () => {
-            const id = await createChatSession();
-            setChatSessions(await getChatSessions());
-            setActiveSessionId(id);
+            try {
+              const id = await createChatSession();
+              setChatSessions(await getChatSessions());
+              setActiveSessionId(id);
+            } catch (error) {
+              console.warn('⚠️ Failed to create persisted chat session:', error);
+              switchToEphemeralMode(error?.message || 'create session failed');
+              const id = `local-${Date.now()}`;
+              setChatSessions((prev) => [{ id, title: `Local Chat ${prev.length + 1}`, createdAt: new Date().toISOString() }, ...prev]);
+              setActiveSessionId(id);
+              showToast('Storage unavailable. Created a temporary local session.', 6000);
+            }
             setActiveView('chat');
           }}
           onSelectSession={(id) => {
@@ -467,13 +699,40 @@ export default function MathWorkspace() {
             setActiveView('chat');
           }}
           onRenameSession={async (id, title) => {
-            await updateSessionTitle(id, title);
-            setChatSessions(await getChatSessions());
+            if (isEphemeralSessionId(id)) {
+              setChatSessions((prev) => prev.map((s) => (String(s.id) === String(id) ? { ...s, title } : s)));
+              return;
+            }
+            try {
+              await updateSessionTitle(id, title);
+              setChatSessions(await getChatSessions());
+            } catch {
+              switchToEphemeralMode('rename session failed');
+            }
           }}
           onDeleteSession={async (id) => {
-            await deleteChatSession(id);
-            const sessions = await getChatSessions();
-            setChatSessions(sessions);
+            if (isEphemeralSessionId(id)) {
+              const sessions = chatSessions.filter((s) => String(s.id) !== String(id));
+              setChatSessions(sessions);
+              setEphemeralMessagesBySession((prev) => {
+                const next = { ...prev };
+                delete next[id];
+                return next;
+              });
+              if (String(id) === String(activeSessionId)) {
+                setActiveSessionId(sessions[0]?.id ?? null);
+              }
+              return;
+            }
+
+            let sessions = [];
+            try {
+              await deleteChatSession(id);
+              sessions = await getChatSessions();
+              setChatSessions(sessions);
+            } catch {
+              switchToEphemeralMode('delete session failed');
+            }
             if (String(id) === String(activeSessionId)) {
               const nextId = sessions[0]?.id ?? null;
               setActiveSessionId(nextId);
@@ -514,27 +773,62 @@ export default function MathWorkspace() {
         {activeView === 'quiz' && (
           <QuizView
             topicId={selectedTopic || 'polynomials'}
-            onSubmit={async ({ topicId, mcqScore, mcqTotal }) => {
-              // Update marks with quiz results and keep in quiz view
-              setGradingResult({
-                score: mcqScore,
-                maxScore: mcqTotal,
-                percentage: Math.round((mcqScore / mcqTotal) * 100),
-                stepResults: [
-                  {
-                    stepNumber: 1,
-                    marksAwarded: mcqScore,
-                    maxMarks: mcqTotal,
-                    status: mcqScore / mcqTotal >= 0.8 ? 'correct' : 'partial',
-                    feedback: `MCQ score: ${mcqScore}/${mcqTotal}. Good effort! Review any incorrect answers.`,
-                  }
-                ],
-                feedback: `You scored ${mcqScore}/${mcqTotal} on the multiple choice questions. Keep practicing to improve!`,
-                grade: mcqScore / mcqTotal >= 0.8 ? 'A' : mcqScore / mcqTotal >= 0.6 ? 'B' : 'C',
-                mistakeTypes: [],
-              });
-              // Toast the result
-              showToast(`Quiz submitted! Score: ${mcqScore}/${mcqTotal} (${Math.round((mcqScore / mcqTotal) * 100)}%)`);
+            onSubmit={async ({ topicId, mcqScore, mcqTotal, solveAnswer, solveExpected }) => {
+              const solveMax = 5;
+              const solveCorrect = areMathAnswersEquivalent(solveAnswer, solveExpected);
+              const solveScore = solveCorrect ? solveMax : Math.max(1, Math.round(solveMax * 0.4));
+
+              const score = mcqScore + solveScore;
+              const maxScore = mcqTotal + solveMax;
+              const percentage = Math.round((score / maxScore) * 100);
+
+              const stepResults = [
+                {
+                  stepNumber: 1,
+                  marksAwarded: mcqScore,
+                  maxMarks: mcqTotal,
+                  status: mcqScore / mcqTotal >= 0.8 ? 'correct' : mcqScore / mcqTotal >= 0.5 ? 'partial' : 'incorrect',
+                  feedback: `MCQ score: ${mcqScore}/${mcqTotal}.`,
+                },
+                {
+                  stepNumber: 2,
+                  marksAwarded: solveScore,
+                  maxMarks: solveMax,
+                  status: solveCorrect ? 'correct' : 'partial',
+                  feedback: solveCorrect
+                    ? 'Solve question: correct final answer.'
+                    : `Solve question: partial credit awarded. Expected a result equivalent to ${solveExpected}.`,
+                },
+              ];
+
+              const grade = percentage >= 90 ? 'A+' : percentage >= 80 ? 'A' : percentage >= 70 ? 'B' : percentage >= 60 ? 'C' : percentage >= 50 ? 'D' : 'F';
+              const nextResult = {
+                topicId,
+                score,
+                maxScore,
+                percentage,
+                stepResults,
+                feedback: `Quiz result: ${score}/${maxScore}. ${solveCorrect ? 'Great solving accuracy.' : 'Review the solving step for full credit.'}`,
+                grade,
+                mistakeTypes: solveCorrect ? [] : ['final_answer_mismatch'],
+              };
+
+              try {
+                await saveExamResult(nextResult);
+                await awardStepByStep(score, maxScore);
+              } catch {
+                switchToEphemeralMode('saving quiz result failed');
+              }
+
+              setGradingResult(nextResult);
+              try {
+                await refreshData();
+              } catch {
+                // Non-blocking refresh failure
+              }
+
+              showToast(`Quiz submitted! Score: ${score}/${maxScore} (${percentage}%)`);
+              return nextResult;
             }}
           />
         )}
@@ -616,12 +910,84 @@ export default function MathWorkspace() {
         )}
       </main>
 
-      {/* Right Sidebar — Marks (only show in quiz view or if marks available) */}
-      {(activeView === 'quiz' || gradingResult) && (
-        <aside className="workspace-sidebar-right">
+      {/* Right Sidebar — Always visible utility rail */}
+      <aside className="workspace-sidebar-right">
+        {(activeView === 'quiz' || gradingResult) ? (
           <MarksDashboard gradingResult={gradingResult} examHistory={examHistory} />
-        </aside>
-      )}
+        ) : (
+          <div className="side-rail">
+            <div className="side-rail-card">
+              <h4>Live Chat Status</h4>
+              <div className="side-rail-row"><span>AI mode</span><b>{aiMode === 'online' ? 'Online' : 'Local'}</b></div>
+              <div className="side-rail-row"><span>Messages</span><b>{messages.length}</b></div>
+              <div className="side-rail-row"><span>Session</span><b>{activeSessionId ? 'Active' : 'None'}</b></div>
+              <div className="side-rail-row"><span>Storage</span><b>{isEphemeralMode ? 'Temporary' : 'Persistent'}</b></div>
+            </div>
+
+            <div className="side-rail-card">
+              <h4>Side Copilot</h4>
+              <input
+                className="side-rail-input"
+                value={sidePrompt}
+                onChange={(e) => setSidePrompt(e.target.value)}
+                placeholder="Ask for a hint, recap, or revision task..."
+              />
+              <div className="side-rail-actions">
+                <button
+                  className="side-rail-btn"
+                  onClick={() => {
+                    const prompt = sidePrompt.trim();
+                    if (!prompt) return;
+                    handleSend(prompt);
+                    setSidePrompt('');
+                  }}
+                  disabled={!sidePrompt.trim() || isStreaming}
+                >
+                  Send to chat
+                </button>
+                <button
+                  className="side-rail-btn"
+                  onClick={() => {
+                    const topicLabel = selectedTopic ? (getTopic(selectedTopic)?.label || selectedTopic) : 'my current level';
+                    const starter = `Give me 2 quick revision questions for ${topicLabel}.`;
+                    setSidePrompt(starter);
+                  }}
+                >
+                  Insert revision prompt
+                </button>
+              </div>
+            </div>
+
+            <div className="side-rail-card">
+              <h4>Quick Suggestions</h4>
+              <button className="side-rail-btn" onClick={() => handleSend('Give me 3 practice problems for my current level.')}>Practice now</button>
+              <button className="side-rail-btn" onClick={() => handleSend('Explain the last concept in a simpler way.')}>Simpler explanation</button>
+              <button className="side-rail-btn" onClick={() => setActiveView('map')}>Open topic map</button>
+            </div>
+
+            <div className="side-rail-card">
+              <h4>Recent Topics</h4>
+              {topTopics.length === 0 ? (
+                <p className="side-rail-empty">No graded topics yet. Take a quiz to populate this panel.</p>
+              ) : (
+                <div className="side-rail-topics">
+                  {topTopics.map((t) => (
+                    <button
+                      key={t.topicId}
+                      className="side-rail-topic"
+                      onClick={() => handleTopicSelect(t.topicId)}
+                      title={`${t.accuracy}% accuracy over ${t.attempts} attempts`}
+                    >
+                      <span>{getTopic(t.topicId)?.label || t.topicId}</span>
+                      <b>{t.accuracy}%</b>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </aside>
 
       {/* Report Overlay */}
       {showReport && (

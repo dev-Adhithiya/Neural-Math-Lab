@@ -20,11 +20,11 @@ function topicInitials(label) {
 }
 
 function buildLayout() {
-  const colsPerRow = 3;  // 3 columns per row
-  const rowHeight = 140;
-  const colWidth = 220;
-  const margin = { x: 25, y: 25 };
-  const node = { w: 190, h: 60 };
+  const colsPerRow = Math.min(4, Math.max(3, TOPICS.length));
+  const rowHeight = 178;
+  const colWidth = 290;
+  const margin = { x: 38, y: 36 };
+  const node = { w: 248, h: 86 };
 
   // Grid layout: arrange in 3-column rows
   const positions = new Map();
@@ -139,14 +139,14 @@ export default function TopicMap({ selectedTopic, onSelectTopic }) {
                 tabIndex={0}
               >
                 <rect className="topic-map-rect" width={layout.node.w} height={layout.node.h} rx="8" />
-                <rect className="topic-map-badge" x="8" y="8" width="28" height="28" rx="6" />
-                <text className="topic-map-badge-text" x="22" y="25" textAnchor="middle" fontSize="11" fontWeight="500">
+                <rect className="topic-map-badge" x="10" y="10" width="34" height="34" rx="8" />
+                <text className="topic-map-badge-text" x="27" y="32" textAnchor="middle" fontSize="12" fontWeight="500">
                   {topicInitials(t.label) || '•'}
                 </text>
-                <text className="topic-map-title" x="50" y="22" fontSize="14" fontWeight="700">
+                <text className="topic-map-title" x="54" y="33" fontSize="15" fontWeight="700">
                   {t.label}
                 </text>
-                <text className="topic-map-meta" x="50" y="40" fontSize="11">
+                <text className="topic-map-meta" x="54" y="58" fontSize="12">
                   {t.category} • T{t.tier}
                 </text>
               </g>

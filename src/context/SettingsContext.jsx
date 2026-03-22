@@ -7,8 +7,8 @@ function getEnvDefaults() {
   return {
     theme: 'dark', // 'dark' | 'light'
     studentName: import.meta.env.VITE_STUDENT_NAME || 'Student',
-    aiMode: 'online', // 'online' | 'offline'
-    provider: (import.meta.env.VITE_GEMINI_KEY ? 'gemini' : 'azure'), // 'gemini' | 'azure'
+    aiMode: 'offline', // 'online' | 'offline' (default offline for fresh stability)
+    provider: 'ollama', // 'azure' | 'gemini' | 'ollama'
     geminiKey: import.meta.env.VITE_GEMINI_KEY || '',
     azureEndpoint: import.meta.env.VITE_AZURE_OPENAI_ENDPOINT || '',
     azureKey: import.meta.env.VITE_AZURE_OPENAI_KEY || '',
@@ -21,13 +21,23 @@ function getEnvDefaults() {
 
     // Local provider (Ollama)
     ollamaUrl: import.meta.env.VITE_OLLAMA_URL || 'http://localhost:11434/api/generate',
-    ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'phi3:mini',
+    ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'deepseek-r1:7b',
+
+    // Safety / governance
+    strictMode: true,
+    retentionEnabled: true,
+    retentionDays: 30,
+    localEncryptionEnabled: false,
   };
 }
 
 function mergeSettings(defaults, stored, profile) {
   const merged = { ...defaults, ...stored };
   if (profile?.name) merged.studentName = profile.name;
+  // One-time migration from old local default.
+  if (!merged.ollamaModel || merged.ollamaModel === 'phi3:mini') {
+    merged.ollamaModel = 'deepseek-r1:7b';
+  }
   // Auto-pick provider if user has one key but not the other
   if (merged.provider !== 'azure' && merged.provider !== 'gemini') {
     merged.provider = merged.geminiKey ? 'gemini' : 'azure';

@@ -29,13 +29,19 @@ export default function ChatAssistant({
   const [input, setInput] = useState('');
   const [uploadError, setUploadError] = useState('');
   const [pendingImage, setPendingImage] = useState(null);
+  const messagesContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Auto-scroll to bottom
+  // Auto-scroll to bottom on new messages (smooth) and streaming updates (instant).
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const behavior = isStreaming ? 'auto' : 'smooth';
+    requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior });
+    });
   }, [messages, streamingText]);
 
   const handleSend = useCallback(() => {
@@ -115,7 +121,7 @@ export default function ChatAssistant({
       </div>
 
       {/* Messages Area */}
-      <div className="chat-messages">
+      <div className="chat-messages" ref={messagesContainerRef}>
         {messages.length === 0 && !isStreaming && (
           <div className="chat-welcome">
             <div className="welcome-icon">👋</div>

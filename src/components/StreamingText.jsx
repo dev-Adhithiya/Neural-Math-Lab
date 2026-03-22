@@ -13,36 +13,47 @@ import katex from 'katex';
 export function renderMathInText(text) {
   if (!text) return '';
 
-  let html = text;
+  let html = String(text);
+  const mathPlaceholders = [];
+  const stashMath = (rendered) => {
+    const token = `__MATH_${mathPlaceholders.length}__`;
+    mathPlaceholders.push(rendered);
+    return token;
+  };
 
-  // Process math BEFORE escaping HTML to prevent KaTeX issues
+  // Normalize ChatGPT-style delimiters to $ and $$ for one rendering path.
+  html = html
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_, latex) => `$$${latex}$$`)
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_, latex) => `$${latex}$`);
+
+  // Process math before escaping plain text.
   // Display math: $$...$$
   html = html.replace(/\$\$([\s\S]*?)\$\$/g, (_, latex) => {
     try {
-      return `<div class="math-display">${katex.renderToString(latex.trim(), {
+      return stashMath(`<div class="math-display">${katex.renderToString(latex.trim(), {
         displayMode: true,
         throwOnError: false,
-      })}</div>`;
+      })}</div>`);
     } catch {
       const escaped = latex.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      return `<div class="math-display math-error">${escaped}</div>`;
+      return stashMath(`<div class="math-display math-error">${escaped}</div>`);
     }
   });
 
   // Inline math: $...$
   html = html.replace(/\$([^\$\n]+?)\$/g, (_, latex) => {
     try {
-      return katex.renderToString(latex.trim(), {
+      return stashMath(katex.renderToString(latex.trim(), {
         displayMode: false,
         throwOnError: false,
-      });
+      }));
     } catch {
       const escaped = latex.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      return `<code class="math-error">${escaped}</code>`;
+      return stashMath(`<code class="math-error">${escaped}</code>`);
     }
   });
 
-  // NOW escape HTML for non-math content
+  // Escape only non-math text.
   html = html
     .replace(/&(?!amp;|lt;|gt;|#)/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -79,6 +90,9 @@ export function renderMathInText(text) {
     /\[GRAPH:\s*([^\]]+)\]/g,
     '<div class="graph-tag">📈 Graphing: <code>$1</code></div>'
   );
+
+  // Restore rendered math after markdown/escaping transforms.
+  html = html.replace(/__MATH_(\d+)__/g, (_, idx) => mathPlaceholders[Number(idx)] || '');
 
   return html;
 }

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useSettings } from '../context/SettingsContext.jsx';
+import { exportAllData, resetAllData } from '../store/localVault.js';
 
 export default function SettingsModal({ isOpen, onClose }) {
   const { settings, updateSettings, isLoaded } = useSettings();
@@ -39,7 +40,11 @@ export default function SettingsModal({ isOpen, onClose }) {
         azureSearchIndex: (draft.azureSearchIndex || '').trim(),
 
         ollamaUrl: (draft.ollamaUrl || '').trim() || 'http://localhost:11434/api/generate',
-        ollamaModel: (draft.ollamaModel || '').trim() || 'phi3:mini',
+        ollamaModel: (draft.ollamaModel || '').trim() || 'deepseek-r1:7b',
+        strictMode: draft.strictMode !== false,
+        retentionEnabled: draft.retentionEnabled !== false,
+        retentionDays: Math.max(1, Number(draft.retentionDays || 30)),
+        localEncryptionEnabled: draft.localEncryptionEnabled === true,
       };
       await updateSettings(next);
       onClose?.();
@@ -50,6 +55,24 @@ export default function SettingsModal({ isOpen, onClose }) {
 
   const handleOverlayClick = (e) => {
     if (e.target === e.currentTarget) onClose?.();
+  };
+
+  const handleExportData = async () => {
+    const payload = await exportAllData();
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `neural-math-lab-export-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDeleteAllData = async () => {
+    const ok = window.confirm('Delete all local data (chat history, reports, settings)? This cannot be undone.');
+    if (!ok) return;
+    await resetAllData();
+    window.location.reload();
   };
 
   return (
@@ -98,7 +121,52 @@ export default function SettingsModal({ isOpen, onClose }) {
             </label>
           </div>
           <div className="settings-hint">
-            Local AI routes to Ollama when offline. Chat uses <code>phi3:mini</code> (Microsoft); image OCR uses <code>minicpm-v</code> for vision.
+            Local AI routes to Ollama when offline. Chat uses <code>deepseek-r1:7b</code>; image OCR uses <code>minicpm-v</code> for vision.
+          </div>
+
+          <div className="settings-divider" />
+
+          <h3>Safety & Governance</h3>
+          <label className="settings-checkbox">
+            <input
+              type="checkbox"
+              checked={draft.strictMode !== false}
+              onChange={(e) => setDraft((p) => ({ ...p, strictMode: e.target.checked }))}
+            />
+            <span>Strict mode (policy blocks for prompt injection and unsafe content)</span>
+          </label>
+
+          <label className="settings-checkbox">
+            <input
+              type="checkbox"
+              checked={draft.retentionEnabled !== false}
+              onChange={(e) => setDraft((p) => ({ ...p, retentionEnabled: e.target.checked }))}
+            />
+            <span>Enable auto-delete by retention policy</span>
+          </label>
+
+          <div className="settings-field">
+            <label>Retention days</label>
+            <input
+              type="number"
+              min="1"
+              value={draft.retentionDays ?? 30}
+              onChange={(e) => setDraft((p) => ({ ...p, retentionDays: Number(e.target.value || 30) }))}
+            />
+          </div>
+
+          <label className="settings-checkbox">
+            <input
+              type="checkbox"
+              checked={draft.localEncryptionEnabled === true}
+              onChange={(e) => setDraft((p) => ({ ...p, localEncryptionEnabled: e.target.checked }))}
+            />
+            <span>Encrypt local state (requires VITE_LOCAL_VAULT_KEY in env)</span>
+          </label>
+
+          <div className="settings-row" style={{ marginTop: 8 }}>
+            <button className="settings-btn secondary" type="button" onClick={handleExportData}>Export data</button>
+            <button className="settings-btn secondary" type="button" onClick={handleDeleteAllData}>Delete all local data</button>
           </div>
         </div>
 
@@ -177,7 +245,7 @@ export default function SettingsModal({ isOpen, onClose }) {
             <input
               value={draft.ollamaModel || ''}
               onChange={set('ollamaModel')}
-              placeholder="phi3:mini"
+              placeholder="deepseek-r1:7b"
             />
           </div>
 

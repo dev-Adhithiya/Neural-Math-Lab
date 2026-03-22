@@ -12,6 +12,86 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { BrainSwitch } from '../providers/BrainSwitch.js';
 
+function createThoughtFilter() {
+  let inHiddenBlock = false;
+  let pending = '';
+  const maxTagCarry = 16;
+
+  return {
+    push(chunk) {
+      if (!chunk) return '';
+      pending += String(chunk);
+
+      let out = '';
+      while (pending.length > 0) {
+        if (!inHiddenBlock) {
+          const lower = pending.toLowerCase();
+          const iThink = lower.indexOf('<think>');
+          const iThinking = lower.indexOf('<thinking>');
+
+          let start = -1;
+          let tagLen = 0;
+          if (iThink >= 0 && (iThinking < 0 || iThink < iThinking)) {
+            start = iThink;
+            tagLen = '<think>'.length;
+          } else if (iThinking >= 0) {
+            start = iThinking;
+            tagLen = '<thinking>'.length;
+          }
+
+          if (start < 0) {
+            // Keep a small carry to safely match tags split across chunks.
+            const emitLen = Math.max(0, pending.length - maxTagCarry);
+            if (emitLen === 0) break;
+            out += pending.slice(0, emitLen);
+            pending = pending.slice(emitLen);
+            continue;
+          }
+
+          out += pending.slice(0, start);
+          pending = pending.slice(start + tagLen);
+          inHiddenBlock = true;
+          continue;
+        }
+
+        const lower = pending.toLowerCase();
+        const iEndThink = lower.indexOf('</think>');
+        const iEndThinking = lower.indexOf('</thinking>');
+
+        let end = -1;
+        let endLen = 0;
+        if (iEndThink >= 0 && (iEndThinking < 0 || iEndThink < iEndThinking)) {
+          end = iEndThink;
+          endLen = '</think>'.length;
+        } else if (iEndThinking >= 0) {
+          end = iEndThinking;
+          endLen = '</thinking>'.length;
+        }
+
+        if (end < 0) {
+          // Drop most hidden text but keep a tiny tail to detect closing tag split.
+          if (pending.length > maxTagCarry) {
+            pending = pending.slice(-maxTagCarry);
+          }
+          break;
+        }
+
+        pending = pending.slice(end + endLen);
+        inHiddenBlock = false;
+      }
+
+      return out;
+    },
+    flush() {
+      // Emit remaining visible tail only when not inside a hidden block.
+      if (inHiddenBlock) return '';
+      const tail = pending;
+      pending = '';
+      return tail;
+    },
+  };
+}
+
 /**
  * @typedef {Object} UseAIReturn
  * @property {'online'|'offline'} mode
@@ -47,7 +127,8 @@ export function useAI(appSettings = {}) {
       azureSearchIndex: appSettings.azureSearchIndex || '',
 
       ollamaUrl: appSettings.ollamaUrl || 'http://localhost:11434/api/generate',
-      ollamaModel: appSettings.ollamaModel || 'phi3:mini',
+      ollamaModel: appSettings.ollamaModel || 'deepseek-r1:7b',
+      strictMode: appSettings.strictMode !== false,
     });
   }, [
     mode,
@@ -59,6 +140,7 @@ export function useAI(appSettings = {}) {
     appSettings.azureSearchIndex,
     appSettings.ollamaUrl,
     appSettings.ollamaModel,
+    appSettings.strictMode,
   ]);
 
   // If settings changed externally, sync mode
@@ -87,12 +169,16 @@ export function useAI(appSettings = {}) {
     setRouteBadge(null);
 
     let fullText = '';
+    const thoughtFilter = createThoughtFilter();
     let tokenBuffer = '';
     let lastFlush = performance.now();
     const flushBuffer = () => {
       if (!tokenBuffer) return;
-      fullText += tokenBuffer;
-      onToken?.(tokenBuffer);
+      const delta = thoughtFilter.push(tokenBuffer);
+      if (delta) {
+        fullText += delta;
+        onToken?.(delta);
+      }
       tokenBuffer = '';
       lastFlush = performance.now();
     };
@@ -108,12 +194,17 @@ export function useAI(appSettings = {}) {
         const now = performance.now();
 
         // Send tokens in small batches to reduce rerender churn and improve perceived latency.
-        if (tokenBuffer.length >= 4 || now - lastFlush > 40) {
+        if (tokenBuffer.length >= 3 || now - lastFlush > 24) {
           flushBuffer();
         }
       }
 
       flushBuffer();
+      const finalTail = thoughtFilter.flush();
+      if (finalTail) {
+        fullText += finalTail;
+        onToken?.(finalTail);
+      }
       onDone?.(fullText);
     } catch (err) {
       console.error('[useAI] stream error:', err);

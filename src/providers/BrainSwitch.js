@@ -19,7 +19,7 @@ const DEFAULTS = {
 
   // Local (Ollama)
   ollamaUrl: 'http://localhost:11434/api/generate',
-  ollamaModel: 'phi3:mini',
+  ollamaModel: 'deepseek-r1:7b',
 };
 
 export class BrainSwitch {
@@ -99,7 +99,10 @@ export class BrainSwitch {
     opts.onBadge?.(route === 'ollama' ? 'local' : null);
 
     if (route === 'ollama') {
-      const prompt = this._messagesToPrompt(messages);
+      const prompt = this._messagesToPrompt(messages, {
+        maxMessages: 12,
+        maxChars: 12000,
+      });
       yield* this._streamOllama(prompt, opts);
       return;
     }
@@ -157,11 +160,22 @@ export class BrainSwitch {
     );
   }
 
-  _messagesToPrompt(messages) {
-    return (messages || [])
+  _messagesToPrompt(messages, opts = {}) {
+    const maxMessages = Number.isFinite(opts.maxMessages) ? opts.maxMessages : 12;
+    const maxChars = Number.isFinite(opts.maxChars) ? opts.maxChars : 12000;
+
+    const rows = (messages || []).slice(-maxMessages);
+    let prompt = rows
       .map((m) => `${m.role}: ${m.content}`)
       .join('\n')
       .trim();
+
+    // Trim very long prompts to keep local inference responsive.
+    if (prompt.length > maxChars) {
+      prompt = prompt.slice(prompt.length - maxChars);
+    }
+
+    return prompt;
   }
 
   /* ───────────────────────── Online (Azure) ───────────────────────── */
@@ -213,22 +227,14 @@ export class BrainSwitch {
   }
 
   async _tryRag(query) {
-    const { azureSearchEndpoint, azureSearchKey, azureSearchIndex } = this.config;
-    if (!azureSearchEndpoint || !azureSearchKey || !azureSearchIndex) return null;
     if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
 
-    const url = `${azureSearchEndpoint.replace(/\/+$/, '')}/indexes/${encodeURIComponent(azureSearchIndex)}/docs/search?api-version=2023-11-01`;
-    const res = await fetch(url, {
+    const res = await fetch('/api/proxy/rag/search', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'api-key': azureSearchKey,
       },
-      body: JSON.stringify({
-        search: query,
-        top: 4,
-        queryType: 'simple',
-      }),
+      body: JSON.stringify({ query, top: 4, strictMode: this.config.strictMode ?? true }),
     });
     if (!res.ok) return null;
     const json = await res.json();
@@ -248,21 +254,14 @@ export class BrainSwitch {
   }
 
   async *_streamAzureChat(messages, opts) {
-    const { azureEndpoint, azureKey, azureDeployment, azureApiVersion } = this.config;
-    if (!azureEndpoint || !azureKey || !azureDeployment) {
-      throw new Error('Azure settings missing (endpoint/key/deployment). Open Settings (⚙️).');
-    }
-
     const maxTokens = opts?.generation?.maxTokens ?? opts.maxTokens ?? this.config.maxTokens;
     const temperature = opts?.generation?.temperature ?? opts.temperature ?? this.config.temperature;
 
-    const url = `${azureEndpoint.replace(/\/+$/, '')}/openai/deployments/${encodeURIComponent(azureDeployment)}/chat/completions?api-version=${encodeURIComponent(azureApiVersion || DEFAULTS.azureApiVersion)}`;
     this.abortController = new AbortController();
-    const res = await fetch(url, {
+    const res = await fetch('/api/proxy/azure/chat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'api-key': azureKey,
       },
       signal: this.abortController.signal,
       body: JSON.stringify({
@@ -270,6 +269,7 @@ export class BrainSwitch {
         stream: true,
         temperature,
         max_tokens: maxTokens,
+        strictMode: this.config.strictMode ?? true,
       }),
     });
 
@@ -281,23 +281,17 @@ export class BrainSwitch {
   }
 
   async _azureNonStreaming(messages) {
-    const { azureEndpoint, azureKey, azureDeployment, azureApiVersion } = this.config;
-    if (!azureEndpoint || !azureKey || !azureDeployment) {
-      throw new Error('Azure settings missing (endpoint/key/deployment). Open Settings (⚙️).');
-    }
-    const url = `${azureEndpoint.replace(/\/+$/, '')}/openai/deployments/${encodeURIComponent(azureDeployment)}/chat/completions?api-version=${encodeURIComponent(azureApiVersion || DEFAULTS.azureApiVersion)}`;
-
-    const res = await fetch(url, {
+    const res = await fetch('/api/proxy/azure/chat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'api-key': azureKey,
       },
       body: JSON.stringify({
         messages,
         stream: false,
         temperature: this.config.temperature,
         max_tokens: 1024,
+        strictMode: this.config.strictMode ?? true,
       }),
     });
     if (!res.ok) throw new Error(`Azure API ${res.status}: ${await res.text()}`);
@@ -335,42 +329,87 @@ export class BrainSwitch {
   /* ───────────────────────── Local (Ollama) ───────────────────────── */
 
   async *_streamOllama(prompt, opts) {
-    const url = this.config.ollamaUrl || DEFAULTS.ollamaUrl;
+    const directUrl = this.config.ollamaUrl || DEFAULTS.ollamaUrl;
     const model = this.config.ollamaModel || DEFAULTS.ollamaModel;
+    const maxTokens = opts?.generation?.maxTokens ?? opts.maxTokens ?? this.config.maxTokens;
+    const payload = {
+      model,
+      prompt,
+      stream: true,
+      keep_alive: '10m',
+      strictMode: this.config.strictMode ?? true,
+      options: {
+        temperature: opts?.generation?.temperature ?? opts.temperature ?? this.config.temperature,
+        num_predict: maxTokens,
+      },
+    };
 
-    this.abortController = new AbortController();
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: this.abortController.signal,
-      body: JSON.stringify({
-        model,
-        prompt,
-        stream: true,
-        options: {
-          temperature: opts?.generation?.temperature ?? opts.temperature ?? this.config.temperature,
-          num_gpu: 1,
-        },
-      }),
-    });
+    const shouldFallbackFromProxyError = (txt) => {
+      const t = String(txt || '').toLowerCase();
+      return (
+        t.includes('econnrefused')
+        || t.includes('failed to fetch')
+        || t.includes('cannot proxy')
+        || t.includes('connect error')
+        || t.includes('proxy error')
+      );
+    };
 
-    if (!res.ok) {
-      const rawText = await res.text();
-      const message = rawText || `status ${res.status}`;
+    const doRequest = async (url, isProxyAttempt) => {
+      this.abortController = new AbortController();
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: this.abortController.signal,
+        body: JSON.stringify(payload),
+      });
 
-      if (/model requires more system memory/i.test(message)) {
-        throw new Error(
-          `Ollama memory error: ${message}. Please switch to a smaller model (e.g., phi3:tiny) in Settings or select online mode.`
-        );
+      if (!res.ok) {
+        const rawText = await res.text();
+        if (isProxyAttempt && (res.status >= 500 || shouldFallbackFromProxyError(rawText))) {
+          // Proxy is down/unreachable: try talking to local Ollama directly.
+          return doRequest(directUrl, false);
+        }
+
+        const parsedError = (() => {
+          try {
+            const j = JSON.parse(rawText);
+            return j?.error || j?.message || rawText;
+          } catch {
+            return rawText;
+          }
+        })();
+
+        const message = parsedError || `status ${res.status}`;
+
+        if (/model requires more system memory/i.test(message)) {
+          throw new Error(
+            `Ollama memory error: ${message}. Try a smaller model or use online mode.`
+          );
+        }
+
+        if (/runner process has terminated/i.test(message) || /cuda error/i.test(message)) {
+          throw new Error(
+            `Ollama runtime error: ${message}. Restart Ollama, reduce model size, or switch to online mode.`
+          );
+        }
+
+        throw new Error(`Ollama ${res.status}: ${message}`);
       }
 
-      if (/runner process has terminated/i.test(message) || /cuda error/i.test(message)) {
-        throw new Error(
-          `Ollama runtime error: ${message}. Try restarting the Ollama daemon, reducing model size, or switching to online provider.`
-        );
-      }
+      return res;
+    };
 
-      throw new Error(`Ollama ${res.status}: ${message}`);
+    let res;
+    try {
+      res = await doRequest('/api/proxy/ollama/chat', true);
+    } catch (err) {
+      // If proxy route itself is unreachable in dev, try direct Ollama URL.
+      if (shouldFallbackFromProxyError(err?.message || '')) {
+        res = await doRequest(directUrl, false);
+      } else {
+        throw err;
+      }
     }
 
     const reader = res.body.getReader();

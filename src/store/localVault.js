@@ -1,213 +1,377 @@
 /**
  * @module localVault
- * @description IndexedDB persistence layer via Dexie.js.
+ * @description LocalStorage persistence layer.
  *
- * Tables:
+ * Data Stores:
  *   userProfile          — name, level, totalXP, joinedAt
- *   mistakes             — topicId, problem, description, date, corrected
- *   examMarks            — topicId, score, maxScore, date, stepResults
- *   prerequisiteProgress — topicId, status, completedAt, xp
- *   chatHistory          — role, content, timestamp, sessionId
- *   settings             — key-value store for API keys, theme, etc.
- *   chatSessions         — id, title, createdAt, lastMessageAt
+ *   mistakes             — array of {id, topicId, problem, description, date, corrected}
+ *   examMarks            — array of {id, topicId, score, maxScore, date, stepResults}
+ *   prerequisiteProgress — array of {topicId, status, completedAt, xp}
+ *   chatHistory          — array of {id, role, content, timestamp, sessionId}
+ *   settings             — key-value map
+ *   chatSessions         — array of {id, title, createdAt, lastMessageAt}
  */
 
-import Dexie from 'dexie';
+import CryptoJS from 'crypto-js';
 
-const db = new Dexie('NeuralMathLab');
+const VAULT_KEY = import.meta.env.VITE_LOCAL_VAULT_KEY || '';
 
-db.version(1).stores({
-  userProfile: '++id, name',
-  mistakes: '++id, topicId, date, corrected',
-  examMarks: '++id, topicId, date',
-  prerequisiteProgress: 'topicId, status',
-  chatHistory: '++id, sessionId, timestamp',
-});
+function getRawStore(key) {
+  try {
+    const data = localStorage.getItem(key);
+    return data ? JSON.parse(data) : null;
+  } catch {
+    return null;
+  }
+}
 
-db.version(2).stores({
-  userProfile: '++id, name',
-  mistakes: '++id, topicId, date, corrected',
-  examMarks: '++id, topicId, date',
-  prerequisiteProgress: 'topicId, status',
-  chatHistory: '++id, sessionId, timestamp',
-  settings: 'key',
-  chatSessions: '++id, createdAt',
-});
+function shouldEncryptStore(key) {
+  if (!VAULT_KEY || key === 'settings') return false;
+  const settings = getRawStore('settings') || {};
+  return settings.localEncryptionEnabled === true;
+}
+
+function encryptPayload(value) {
+  const plain = JSON.stringify(value);
+  return {
+    __enc: true,
+    v: CryptoJS.AES.encrypt(plain, VAULT_KEY).toString(),
+  };
+}
+
+function decryptPayload(payload) {
+  try {
+    const bytes = CryptoJS.AES.decrypt(payload.v, VAULT_KEY);
+    const plain = bytes.toString(CryptoJS.enc.Utf8);
+    return JSON.parse(plain);
+  } catch {
+    return null;
+  }
+}
+
+function getRetentionDays() {
+  const settings = getRawStore('settings') || {};
+  if (settings.retentionEnabled === false) return 0;
+  const days = Number(settings.retentionDays ?? 30);
+  if (!Number.isFinite(days) || days <= 0) return 0;
+  return Math.floor(days);
+}
+
+function pruneByRetention(items, dateField = 'timestamp') {
+  const retentionDays = getRetentionDays();
+  if (!retentionDays || !Array.isArray(items) || items.length === 0) return items;
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  return items.filter((item) => {
+    const t = new Date(item?.[dateField] || 0).getTime();
+    return Number.isFinite(t) && t >= cutoff;
+  });
+}
+
+// Helper: Get all items from localStorage store
+function getStore(key, defaultValue = null) {
+  try {
+    const data = localStorage.getItem(key);
+    if (!data) return defaultValue;
+
+    const parsed = JSON.parse(data);
+    if (parsed && parsed.__enc === true) {
+      const decrypted = decryptPayload(parsed);
+      return decrypted ?? defaultValue;
+    }
+
+    return parsed;
+  } catch (error) {
+    console.warn(`⚠️ Error reading ${key} from localStorage:`, error);
+    return defaultValue;
+  }
+}
+
+// Helper: Save items to localStorage store
+function setStore(key, value) {
+  try {
+    const payload = shouldEncryptStore(key) ? encryptPayload(value) : value;
+    localStorage.setItem(key, JSON.stringify(payload));
+  } catch (error) {
+    console.warn(`⚠️ Error writing ${key} to localStorage:`, error);
+  }
+}
+
+// Helper: Generate unique ID
+function generateId() {
+  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
 
 /* ────────────────────── Settings ──────────────────────────── */
 
 export async function getSetting(key) {
-  const row = await db.settings.get(key);
-  return row?.value ?? null;
+  const settings = getStore('settings', {});
+  return settings[key] ?? null;
 }
 
 export async function setSetting(key, value) {
-  await db.settings.put({ key, value });
+  const settings = getStore('settings', {});
+  settings[key] = value;
+  setStore('settings', settings);
 }
 
 export async function getAllSettings() {
-  const rows = await db.settings.toArray();
-  const map = {};
-  for (const r of rows) map[r.key] = r.value;
-  return map;
+  return getStore('settings', {});
 }
 
 /* ────────────────────── User Profile ──────────────────────── */
 
 export async function getProfile(defaultName) {
-  let profile = await db.userProfile.toCollection().first();
-  if (!profile) {
-    const name = defaultName || import.meta.env.VITE_STUDENT_NAME || 'Student';
-    const id = await db.userProfile.add({
-      name,
+  try {
+    let profile = getStore('userProfile');
+    if (!profile) {
+      const name = defaultName || import.meta.env.VITE_STUDENT_NAME || 'Student';
+      profile = {
+        id: 1,
+        name,
+        level: 1,
+        totalXP: 0,
+        joinedAt: new Date().toISOString(),
+      };
+      setStore('userProfile', profile);
+    }
+    return profile;
+  } catch (error) {
+    console.error('❌ getProfile failed:', error);
+    // Return fallback profile
+    return {
+      id: null,
+      name: defaultName || import.meta.env.VITE_STUDENT_NAME || 'Student',
       level: 1,
       totalXP: 0,
       joinedAt: new Date().toISOString(),
-    });
-    profile = await db.userProfile.get(id);
+    };
   }
-  return profile;
 }
 
 export async function updateProfile(fields) {
   const profile = await getProfile();
-  await db.userProfile.update(profile.id, fields);
-  return db.userProfile.get(profile.id);
+  const updated = { ...profile, ...fields };
+  setStore('userProfile', updated);
+  return updated;
 }
 
 /* ────────────────────── Chat Sessions ─────────────────────── */
 
 export async function createChatSession(title) {
-  const id = await db.chatSessions.add({
+  const id = generateId();
+  const sessions = getStore('chatSessions', []);
+  sessions.push({
+    id,
     title: title || `Chat ${new Date().toLocaleString()}`,
     createdAt: new Date().toISOString(),
     lastMessageAt: new Date().toISOString(),
   });
+  setStore('chatSessions', sessions);
   return id;
 }
 
 export async function getChatSessions() {
-  return db.chatSessions.orderBy('createdAt').reverse().toArray();
+  try {
+    const sessions = pruneByRetention(getStore('chatSessions', []), 'createdAt');
+    setStore('chatSessions', sessions);
+    return sessions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  } catch (error) {
+    console.warn('⚠️ getChatSessions failed:', error);
+    return [];
+  }
 }
 
 export async function updateSessionTitle(id, title) {
-  return db.chatSessions.update(id, { title });
+  const sessions = getStore('chatSessions', []);
+  const idx = sessions.findIndex(s => s.id === id);
+  if (idx !== -1) {
+    sessions[idx].title = title;
+    setStore('chatSessions', sessions);
+  }
 }
 
 export async function updateSessionTimestamp(id) {
-  return db.chatSessions.update(id, { lastMessageAt: new Date().toISOString() });
+  const sessions = getStore('chatSessions', []);
+  const idx = sessions.findIndex(s => s.id === id);
+  if (idx !== -1) {
+    sessions[idx].lastMessageAt = new Date().toISOString();
+    setStore('chatSessions', sessions);
+  }
 }
 
 export async function deleteChatSession(id) {
-  await db.chatHistory.where('sessionId').equals(id).delete();
-  return db.chatSessions.delete(id);
+  const sessions = getStore('chatSessions', []);
+  setStore('chatSessions', sessions.filter(s => s.id !== id));
+  
+  const history = getStore('chatHistory', []);
+  setStore('chatHistory', history.filter(m => m.sessionId !== id));
 }
 
 /* ────────────────────── Mistakes ──────────────────────────── */
 
 export async function saveMistake(mistake) {
-  return db.mistakes.add({
+  const mistakes = getStore('mistakes', []);
+  const id = generateId();
+  mistakes.push({
+    id,
     ...mistake,
     date: new Date().toISOString(),
     corrected: false,
   });
+  setStore('mistakes', mistakes);
+  return id;
 }
 
 export async function getMistakes(topicId) {
-  if (topicId) return db.mistakes.where('topicId').equals(topicId).toArray();
-  return db.mistakes.toArray();
+  const mistakes = getStore('mistakes', []);
+  if (topicId) return mistakes.filter(m => m.topicId === topicId);
+  return mistakes;
 }
 
 export async function markMistakeCorrected(id) {
-  return db.mistakes.update(id, { corrected: true });
+  const mistakes = getStore('mistakes', []);
+  const idx = mistakes.findIndex(m => m.id === id);
+  if (idx !== -1) {
+    mistakes[idx].corrected = true;
+    setStore('mistakes', mistakes);
+  }
 }
 
 export async function getUncorrectedMistakes() {
-  return db.mistakes.where('corrected').equals(0).toArray();
+  const mistakes = getStore('mistakes', []);
+  return mistakes.filter(m => !m.corrected);
 }
 
 /* ────────────────────── Exam Marks ───────────────────────── */
 
 export async function saveExamResult(result) {
-  return db.examMarks.add({
+  const examMarks = getStore('examMarks', []);
+  const id = generateId();
+  examMarks.push({
+    id,
     ...result,
     date: new Date().toISOString(),
   });
+  setStore('examMarks', examMarks);
+  return id;
 }
 
 export async function getExamHistory(topicId) {
-  if (topicId) return db.examMarks.where('topicId').equals(topicId).toArray();
-  return db.examMarks.orderBy('date').reverse().toArray();
+  try {
+    const examMarks = getStore('examMarks', []);
+    let filtered = examMarks;
+    if (topicId) {
+      filtered = examMarks.filter(e => e.topicId === topicId);
+    }
+    return filtered.sort((a, b) => new Date(b.date) - new Date(a.date));
+  } catch (error) {
+    console.warn('⚠️ getExamHistory failed:', error);
+    return [];
+  }
 }
 
 export async function getTotalProblemsSolved() {
-  return db.examMarks.count();
+  const examMarks = getStore('examMarks', []);
+  return examMarks.length;
 }
 
 /* ───────────────── Prerequisite Progress ─────────────────── */
 
 export async function updatePrerequisite(topicId, status, xp = 0) {
-  const existing = await db.prerequisiteProgress.get(topicId);
-  if (existing) {
-    return db.prerequisiteProgress.update(topicId, {
+  const progress = getStore('prerequisiteProgress', []);
+  const idx = progress.findIndex(p => p.topicId === topicId);
+  
+  if (idx !== -1) {
+    progress[idx] = {
+      ...progress[idx],
       status,
-      xp: (existing.xp || 0) + xp,
-      completedAt: status === 'mastered' ? new Date().toISOString() : existing.completedAt,
+      xp: (progress[idx].xp || 0) + xp,
+      completedAt: status === 'mastered' ? new Date().toISOString() : progress[idx].completedAt,
+    };
+  } else {
+    progress.push({
+      topicId,
+      status,
+      xp,
+      completedAt: status === 'mastered' ? new Date().toISOString() : null,
     });
   }
-  return db.prerequisiteProgress.add({
-    topicId,
-    status,
-    xp,
-    completedAt: status === 'mastered' ? new Date().toISOString() : null,
-  });
+  
+  setStore('prerequisiteProgress', progress);
 }
 
 export async function getPrerequisiteProgress() {
-  return db.prerequisiteProgress.toArray();
+  try {
+    return getStore('prerequisiteProgress', []);
+  } catch (error) {
+    console.warn('⚠️ getPrerequisiteProgress failed:', error);
+    return [];
+  }
 }
 
 export async function getTopicProgress(topicId) {
-  return db.prerequisiteProgress.get(topicId);
+  const progress = getStore('prerequisiteProgress', []);
+  return progress.find(p => p.topicId === topicId);
 }
 
 /* ────────────────────── Chat History ─────────────────────── */
 
 export async function saveChatMessage(message) {
-  return db.chatHistory.add({
+  const history = pruneByRetention(getStore('chatHistory', []), 'timestamp');
+  const id = generateId();
+  history.push({
+    id,
     ...message,
     timestamp: new Date().toISOString(),
   });
+  setStore('chatHistory', history);
+  return id;
 }
 
 export async function getChatHistory(sessionId) {
-  if (sessionId) {
-    // Ensure stable order for playback
-    return db.chatHistory
-      .where('sessionId')
-      .equals(sessionId)
-      .sortBy('timestamp');
+  try {
+    const history = pruneByRetention(getStore('chatHistory', []), 'timestamp');
+    setStore('chatHistory', history);
+    let filtered = history;
+    if (sessionId) {
+      filtered = history.filter(m => m.sessionId === sessionId);
+    }
+    return filtered.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  } catch (error) {
+    console.warn('⚠️ getChatHistory failed:', error);
+    return [];
   }
-  return db.chatHistory.orderBy('timestamp').toArray();
 }
 
 export async function clearChatHistory() {
-  return db.chatHistory.clear();
+  setStore('chatHistory', []);
 }
 
 /* ────────────────────── Utilities ─────────────────────────── */
 
 export async function resetAllData() {
-  await Promise.all([
-    db.userProfile.clear(),
-    db.mistakes.clear(),
-    db.examMarks.clear(),
-    db.prerequisiteProgress.clear(),
-    db.chatHistory.clear(),
-    db.settings.clear(),
-    db.chatSessions.clear(),
-  ]);
+  localStorage.removeItem('userProfile');
+  localStorage.removeItem('mistakes');
+  localStorage.removeItem('examMarks');
+  localStorage.removeItem('prerequisiteProgress');
+  localStorage.removeItem('chatHistory');
+  localStorage.removeItem('settings');
+  localStorage.removeItem('chatSessions');
 }
 
-export { db };
-export default db;
+export async function exportAllData() {
+  return {
+    exportedAt: new Date().toISOString(),
+    userProfile: getStore('userProfile', null),
+    mistakes: getStore('mistakes', []),
+    examMarks: getStore('examMarks', []),
+    prerequisiteProgress: getStore('prerequisiteProgress', []),
+    chatHistory: getStore('chatHistory', []),
+    settings: getStore('settings', {}),
+    chatSessions: getStore('chatSessions', []),
+  };
+}
+
+// Dummy export for compatibility
+export const db = { name: 'localStorage' };
+export default { name: 'localStorage' };

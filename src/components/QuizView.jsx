@@ -145,7 +145,7 @@ function generatePolynomialQuiz() {
     solve: {
       id: 'solve1',
       prompt: 'Expand and simplify: $(2x - 3)(x + 4) - 5x$',
-      expected: '',
+      expected: '2x^2 - 12',
     },
   };
 }
@@ -181,7 +181,7 @@ function defaultQuiz(topicId, subtopic) {
     solve: {
       id: 'solve1',
       prompt: 'Compute: $8\\times 7$',
-      expected: '',
+      expected: '56',
     },
   };
 }
@@ -249,6 +249,8 @@ export default function QuizView({ topicId, onRequirePhotoProof = true, onSubmit
       subtopic: chosenSubtopic,
       answers,
       solveAnswer: solveAnswer.trim(),
+      solveExpected: quiz.solve.expected,
+      solvePrompt: quiz.solve.prompt,
       proofFile,
       mcqScore,
       mcqTotal,
@@ -266,13 +268,23 @@ export default function QuizView({ topicId, onRequirePhotoProof = true, onSubmit
       }
     }
 
+    const submissionResult = await onSubmit?.(payload);
+    if (submissionResult) {
+      setResult({
+        mcqScore,
+        mcqTotal,
+        totalScore: submissionResult.score,
+        totalMax: submissionResult.maxScore,
+        note: `Submitted. Final score: ${submissionResult.score}/${submissionResult.maxScore} (${submissionResult.percentage}%).`,
+      });
+      return;
+    }
+
     setResult({
       mcqScore,
       mcqTotal,
       note: 'Submitted. A tutor/grader can verify the photo proof and solution.',
     });
-
-    await onSubmit?.(payload);
   };
 
   return (
@@ -390,6 +402,9 @@ export default function QuizView({ topicId, onRequirePhotoProof = true, onSubmit
       {result && (
         <div className="quiz-result">
           <b>MCQ score:</b> {result.mcqScore}/{result.mcqTotal}
+          {typeof result.totalScore === 'number' && typeof result.totalMax === 'number' && (
+            <div><b>Total score:</b> {result.totalScore}/{result.totalMax}</div>
+          )}
           <div className="quiz-result-note">{result.note}</div>
         </div>
       )}

@@ -137,8 +137,14 @@ async function _awardXP(amount, reason) {
  * @returns {Promise<Object>}
  */
 export async function getCurrentLevel() {
-  const profile = await getProfile();
-  return calculateLevel(profile.totalXP || 0);
+  try {
+    const profile = await getProfile();
+    return calculateLevel(profile.totalXP || 0);
+  } catch (error) {
+    console.warn('⚠️ getCurrentLevel failed:', error);
+    // Return default level
+    return calculateLevel(0);
+  }
 }
 
 /**

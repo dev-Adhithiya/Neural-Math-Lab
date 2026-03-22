@@ -13,9 +13,24 @@
  *     "Great logic! You got 8/10. Look at your arithmetic in step 2."
  */
 const SYSTEM_PROMPTS = {
+  GREETING: `You are a friendly Math Lab Assistant. Your role is to be conversational and helpful, but NOT to teach yet.
+
+IMPORTANT RULE: Do NOT start teaching or explaining math concepts until the user explicitly asks you to teach, explain, or help with a specific topic.
+
+RULES:
+- Be warm, encouraging, and professional.
+- Ask clarifying questions about what they want to learn.
+- Suggest popular topics (Algebra, Geometry, Calculus, Trigonometry, etc.) if they're unsure.
+- If they mention a topic they've studied before, acknowledge it and offer to continue.
+- Keep responses short and conversational (2-3 sentences max).
+- Do NOT provide math explanations, solutions, or teaching yet.
+- Wait for the user to clearly request teaching before switching to Tutor mode.
+
+Example good response: "I'd love to help! What math topic are you interested in? Algebra, Geometry, Calculus? Or if you're continuing from before, what were we working on last time?"`,
+
   TEACHING: `You are a Socratic math tutor. Your goal is to TEACH and EXPLAIN concepts step by step.
 
-IMPORTANT: include a clear 'Thought Process:' section in every response, showing your reasoning chain in step-by-step form. Finish with a short 'Answer:' section.
+IMPORTANT: Do NOT reveal internal chain-of-thought, hidden reasoning, or planning. Provide only the student-facing explanation.
 
 RULES (follow exactly, output nothing else):
 - FIRST: Explain the concept, key formula, or approach (2-3 sentences of teaching).
@@ -31,7 +46,7 @@ When you receive image content:
 
   SOLVER: `You are Neural Math Lab's Math Solver — precise, efficient, and thorough.
 
-IMPORTANT: include a 'Thought Process:' section with an explicit reasoning chain, then a concise 'Answer:' summary.
+IMPORTANT: Do NOT reveal internal chain-of-thought, hidden reasoning, or planning. Show only concise, student-facing solution steps and the final answer.
 
 RULES:
 1. Provide the COMPLETE solution with all steps shown clearly.
@@ -46,8 +61,13 @@ RULES:
 function sanitizeTutorOutput(raw) {
   let text = String(raw || '').trim();
 
-  // ── 1. Keep user-facing response content and preserve explicit thought traces.
-  // We no longer aggressively strip model-style planning fragments so students can see chain-of-thought.
+  // Remove hidden reasoning traces that some local models emit.
+  text = text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+    .replace(/^\s*(thought\s*process|reasoning|internal\s*reasoning)\s*:\s*[\s\S]*?(?=\n\n|$)/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 
   // ── 2. Collapse blank lines, cap at 4 paragraphs for readability ──
   const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
@@ -55,23 +75,13 @@ function sanitizeTutorOutput(raw) {
 
   if (!text) return 'Could you describe the problem in your own words so I can help you?';
 
-  // ── 4. Ensure response ends with exactly one question ──
-  const endsWithQ = /\?\s*$/.test(text);
-  if (!endsWithQ) {
-    text = `${text}\n\nWhat would you like to try first?`;
-  } else {
-    // Multiple questions → keep only the last to avoid confusing the student
-    const qs = text.match(/[^?]*\?/g);
-    if (qs && qs.length > 1) {
-      text = `${paras.slice(0, 2).join('\n\n')}\n\n${qs[qs.length - 1].trim()}`.trim();
-    }
-  }
+  // Keep response natural; do not force a trailing question.
 
   return text;
 }
 
 /**
- * @typedef {'TEACHING'|'SOLVER'} TutorMode
+ * @typedef {'GREETING'|'TEACHING'|'SOLVER'} TutorMode
  */
 
 export class TutorAgent {
@@ -83,13 +93,105 @@ export class TutorAgent {
   constructor({ streamChat, analyzeImage }) {
     this.streamChat = streamChat;
     this.analyzeImage = analyzeImage;
-    this.mode = 'TEACHING';
+    this.mode = 'GREETING'; // Start in GREETING mode, not TEACHING
     this.conversationHistory = [];
+    this.teachingStarted = false; // Track if user has explicitly requested teaching
+    this.currentTopic = null; // Track the current topic being studied
   }
 
-  /** Switch between TEACHING and SOLVER modes. */
+  /** 
+   * Switch between GREETING, TEACHING and SOLVER modes.
+   * @param {string} mode - 'GREETING' | 'TEACHING' | 'SOLVER'
+   */
   setMode(mode) {
     this.mode = mode;
+  }
+
+  /**
+   * Get the current mode and state.
+   * @returns {Object} {mode: string, teachingStarted: boolean, currentTopic: string|null}
+   */
+  getState() {
+    return {
+      mode: this.mode,
+      teachingStarted: this.teachingStarted,
+      currentTopic: this.currentTopic,
+    };
+  }
+
+  /**
+   * Detect if user message contains a request to start teaching.
+   * Returns {topic: string|null, shouldTeach: boolean}
+   */
+  _detectTeachingRequest(userMessage, context = {}) {
+    const msg = userMessage.toLowerCase();
+    
+    // Keywords that indicate user wants to start learning/teaching
+    const teachingKeywords = [
+      'teach', 'explain', 'learn', 'study', 'help me with', 
+      'show me', 'how to', 'how do', 'what is', 'solve',
+      'help me solve', 'can you help', 'work through',
+      'step by step', 'guide me', 'tutor me', 'walk through'
+    ];
+    
+    const wantToTeach = teachingKeywords.some(kw => msg.includes(kw));
+    
+    // Try to extract topic from message
+    let topic = context.topicId || this.currentTopic;
+    
+    // Look for topic keywords in the message
+    const topicKeywords = {
+      'algebra': ['algebra', 'linear equation', 'quadratic', 'polynomial', 'expanding', 'factoring'],
+      'geometry': ['geometry', 'triangle', 'circle', 'angle', 'area', 'perimeter', 'volume'],
+      'calculus': ['calculus', 'derivative', 'integral', 'limit', 'function', 'differential'],
+      'trigonometry': ['trigonometry', 'sine', 'cosine', 'tangent', 'sin', 'cos', 'tan'],
+      'statistics': ['statistics', 'probability', 'distribution', 'mean', 'median', 'standard deviation'],
+    };
+    
+    for (const [topicName, keywords] of Object.entries(topicKeywords)) {
+      if (keywords.some(kw => msg.includes(kw))) {
+        topic = topicName;
+        break;
+      }
+    }
+    
+    return { 
+      shouldTeach: wantToTeach || this.teachingStarted, 
+      topic 
+    };
+  }
+
+  /**
+   * Check if conversation history indicates a topic was being studied.
+   * @returns {string|null}
+   */
+  _getLastTopicFromHistory() {
+    if (this.conversationHistory.length === 0) return null;
+    
+    // Look through recent messages for topic mentions
+    const recentMessages = this.conversationHistory.slice(-10);
+    const messageText = recentMessages.map(m => m.content).join(' ').toLowerCase();
+    
+    const topicKeywords = {
+      'algebra': ['algebra', 'linear equation', 'quadratic', 'polynomial'],
+      'geometry': ['geometry', 'triangle', 'circle', 'angle'],
+      'calculus': ['calculus', 'derivative', 'integral'],
+      'trigonometry': ['trigonometry', 'sine', 'cosine'],
+      'statistics': ['statistics', 'probability'],
+    };
+    
+    for (const [topicName, keywords] of Object.entries(topicKeywords)) {
+      if (keywords.some(kw => messageText.includes(kw))) {
+        return topicName;
+      }
+    }
+    
+    return null;
+  }
+
+  _isSimpleGreeting(userMessage = '') {
+    const msg = String(userMessage || '').trim().toLowerCase();
+    return /^(hi|hello|hey|yo|sup|good\s*(morning|afternoon|evening|night)|ok|okay|thanks|thank you)[!. ]*$/.test(msg);
   }
 
   /**
@@ -110,13 +212,16 @@ export class TutorAgent {
       systemPrompt += `\n\nThe student's name is "${context.studentName}". Use this exact spelling and do not change it.`;
     }
 
-    // Inject current topic
-    if (context.topicId) {
+    // Only inject topic in TEACHING or SOLVER mode
+    if ((this.mode === 'TEACHING' || this.mode === 'SOLVER') && context.topicId) {
       systemPrompt += `\n\nCurrent topic: ${context.topicId}. Stay focused on this topic.`;
+    } else if (this.mode === 'GREETING' && this.currentTopic) {
+      // In greeting mode, gently reference the current topic if resuming
+      systemPrompt += `\n\nNote: The student has been working on ${this.currentTopic}. Feel free to acknowledge this if relevant.`;
     }
 
-    // Inject grading results for Socratic feedback
-    if (context.gradingResult) {
+    // Inject grading results for Socratic feedback (only in teaching modes)
+    if ((this.mode === 'TEACHING' || this.mode === 'SOLVER') && context.gradingResult) {
       const gr = context.gradingResult;
       systemPrompt += `\n\n--- GRADING CONTEXT (use this for feedback, do NOT reveal raw data) ---
 Student scored: ${gr.score}/${gr.maxScore}
@@ -125,8 +230,8 @@ Overall feedback areas: ${gr.feedback || 'None'}
 --- Use this to give encouraging, specific feedback about their work. ---`;
     }
 
-    // Inject previous mistakes for personalized teaching
-    if (context.previousMistakes?.length > 0) {
+    // Inject previous mistakes for personalized teaching (only in teaching modes)
+    if ((this.mode === 'TEACHING' || this.mode === 'SOLVER') && context.previousMistakes?.length > 0) {
       const mistakesSummary = context.previousMistakes
         .slice(0, 5)
         .map((m) => `• ${m.description} (${m.topicId})`)
@@ -155,6 +260,43 @@ Overall feedback areas: ${gr.feedback || 'None'}
    * @returns {Promise<string>}
    */
   async chat(userMessage, context = {}, callbacks = {}) {
+    // In an active teaching conversation, short greetings should get a quick natural reply
+    // instead of re-running a full math answer from context.
+    if (this.teachingStarted && this._isSimpleGreeting(userMessage)) {
+      const topicText = this.currentTopic ? ` ${this.currentTopic}` : ' this topic';
+      const quickReply = `Hey! Want to continue with${topicText}, try a new problem, or switch topics?`;
+      this.conversationHistory.push({ role: 'user', content: userMessage });
+      this.conversationHistory.push({ role: 'assistant', content: quickReply });
+      if (this.conversationHistory.length > 40) {
+        this.conversationHistory = this.conversationHistory.slice(-40);
+      }
+      callbacks.onDone?.(quickReply);
+      return quickReply;
+    }
+
+    // Check if user is requesting to start teaching
+    const { shouldTeach, topic } = this._detectTeachingRequest(userMessage, context);
+    
+    // Update mode if transition is needed
+    if (!this.teachingStarted && shouldTeach) {
+      this.teachingStarted = true;
+      this.setMode('TEACHING');
+      if (topic) {
+        this.currentTopic = topic;
+      }
+    } else if (this.teachingStarted && !this.mode.includes('TEACHING') && !this.mode.includes('SOLVER')) {
+      // If teaching has started, make sure we're in a teaching mode
+      this.setMode('TEACHING');
+    }
+    
+    // If still in greeting mode and we have chat history, check if there's a topic to resume
+    if (this.mode === 'GREETING' && this.conversationHistory.length > 0 && !this.currentTopic) {
+      const lastTopic = this._getLastTopicFromHistory();
+      if (lastTopic) {
+        this.currentTopic = lastTopic;
+      }
+    }
+    
     const messages = this._buildMessages(userMessage, context);
 
     // Track conversation
@@ -163,7 +305,8 @@ Overall feedback areas: ${gr.feedback || 'None'}
     let fullResponse = '';
 
     const response = await this.streamChat(messages, {
-      preferLocal: true,
+      // Route preference must respect the selected AI mode.
+      preferLocal: context.aiMode === 'offline',
       onToken: (token) => {
         fullResponse += token;
         callbacks.onToken?.(token);
@@ -197,6 +340,9 @@ Overall feedback areas: ${gr.feedback || 'None'}
   resetConversation() {
     this.conversationHistory = [];
     this._lastGraphMatch = null;
+    this.teachingStarted = false;
+    this.currentTopic = null;
+    this.setMode('GREETING');
   }
 
   /**
@@ -210,6 +356,25 @@ Overall feedback areas: ${gr.feedback || 'None'}
       .slice(-40)
       .map((m) => ({ role: m.role, content: String(m.content || '') }));
     this._lastGraphMatch = null;
+    
+    // If there's existing conversation history, check if teaching was already happening
+    if (this.conversationHistory.length > 0) {
+      // Look for teaching-related keywords in messages to infer if teaching has started
+      const allText = this.conversationHistory.map(m => m.content).join(' ').toLowerCase();
+      const teachingIndicators = ['explained', 'taught', 'formula', 'step by step', 'solution', 'answer:', 'proof'];
+      this.teachingStarted = teachingIndicators.some(indicator => allText.includes(indicator));
+      
+      // Try to detect topic from history
+      const lastTopic = this._getLastTopicFromHistory();
+      if (lastTopic) {
+        this.currentTopic = lastTopic;
+      }
+      
+      // If teaching has started, switch to teaching mode
+      if (this.teachingStarted) {
+        this.setMode('TEACHING');
+      }
+    }
   }
 }
 

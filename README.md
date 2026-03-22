@@ -6,6 +6,9 @@ React + Vite math tutor with:
 - Topic navigation + **node-link Topic Map**
 - Persistent **chat sessions** (IndexedDB)
 - Light/Dark theme toggle
+- **Security proxy backend** for model/API calls (no client-held Azure keys)
+- **Policy middleware** (prompt injection filter, safety categories, blocked outputs, strict mode)
+- **Retention controls** (auto-delete, export/delete, optional encrypted local state)
 
 ### Prerequisites
 
@@ -18,15 +21,25 @@ React + Vite math tutor with:
 npm install
 ```
 
-### Run (dev)
+### Configure env (required)
+
+1. Copy `.env.example` to `.env`
+2. Fill in your own Azure OpenAI + Azure Search (RAG) values
+3. Keep keys only in `.env` (server-side)
+
+### Run (dev, full stack)
 
 ```bash
-npm run dev
+npm run dev:full
 ```
 
-Vite will print a local URL (usually `http://localhost:5173/`). If that port is busy, it will pick the next available port.
+This starts:
+- Frontend (Vite): `http://localhost:5173`
+- Backend proxy: `http://localhost:8787`
 
-### Build (production)
+For hackathon judges cloning from GitHub, this is the recommended command.
+
+### Build (frontend)
 
 ```bash
 npm run build
@@ -37,11 +50,12 @@ npm run preview
 
 Open the app → click **⚙️ Settings**.
 
-#### Online (Azure)
+#### Online (Azure, through backend proxy)
 
-- **Azure endpoint**: `https://YOUR_RESOURCE.openai.azure.com`
-- **Azure key**: your API key
-- **Model deployment**: your deployment name (e.g. `gpt-4o` or `gpt-5`)
+- Configure these in `.env` (server-side), not in browser settings:
+	- `AZURE_OPENAI_ENDPOINT`
+	- `AZURE_OPENAI_KEY`
+	- `AZURE_OPENAI_DEPLOYMENT`
 
 #### Local (Ollama)
 
@@ -54,24 +68,39 @@ ollama serve
 2) Pull the model:
 
 ```bash
-ollama pull phi3:mini
+ollama pull deepseek-r1:7b
 ```
 
 3) In Settings:
 - **AI Mode**: Local (Ollama)
-- **Ollama URL**: `http://localhost:11434/api/generate`
-- **Ollama model**: `phi3:mini`
+- **Ollama URL**: `http://localhost:11434/api/generate` (or leave default)
+- **Ollama model**: `deepseek-r1:7b`
 
 ### (Optional) Online RAG with Azure AI Search
 
 If you have an Azure AI Search index built from `math_textbook.pdf` chunks:
-- Set **Search endpoint**, **Search key**, and **Index name** in Settings.
+- Set server-side env vars:
+	- `AZURE_SEARCH_ENDPOINT`
+	- `AZURE_SEARCH_KEY`
+	- `AZURE_SEARCH_INDEX`
 
-When online, the app will fetch top matches and include them as grounding context for Azure responses.
+When online, the app fetches top matches via proxy and includes them as grounding context for Azure responses.
+
+## Safety, Security, and Governance
+
+- **Prompt injection filter** in backend middleware
+- **Safety categories** detection (violence, self-harm, hate, sexual, cyber abuse)
+- **Blocked outputs** in strict mode for both Azure/Ollama streaming and non-streaming paths
+- **Strict mode toggle** in Settings
+- **Auto-delete retention** with configurable retention days
+- **Data export / delete controls** in Settings
+- **Optional encrypted local state** enabled by:
+	- `VITE_LOCAL_VAULT_KEY` in `.env`
+	- Settings toggle: "Encrypt local state"
 
 ### Notes
 
-- Settings and chat history are stored **locally** in your browser via **IndexedDB**.
-- For a production deployment, don’t call Azure/OpenAI directly from the browser with API keys—use a backend proxy.
+- Settings and chat history are stored locally and can be retention-pruned.
+- Azure/OpenAI and Azure Search keys are kept server-side in `.env` and never required in frontend requests.
 
 "# Neural-Math-Lab" 
