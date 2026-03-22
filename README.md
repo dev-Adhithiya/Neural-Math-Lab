@@ -1,19 +1,37 @@
 ## Neural Math Lab (Hybrid AI Math Tutor)
 
-React + Vite math tutor with:
-- **Online** AI (Azure OpenAI / AI Foundry compatible endpoint) with **streaming**
-- **Local** AI (Ollama) with **streaming**
-- Topic navigation + **node-link Topic Map**
-- Persistent **chat sessions** (IndexedDB)
-- Light/Dark theme toggle
-- **Security proxy backend** for model/API calls (no client-held Azure keys)
-- **Policy middleware** (prompt injection filter, safety categories, blocked outputs, strict mode)
-- **Retention controls** (auto-delete, export/delete, optional encrypted local state)
+A comprehensive, secure, and hackathon-ready math tutoring application built with React + Vite. Features hybrid AI integration (Azure OpenAI + Ollama), multimodal agents for image-based math problem solving, persistent chat sessions, topic mapping, and robust security middleware.
+
+### Key Features
+
+- **Hybrid AI Integration**: Seamlessly switch between online (Azure OpenAI) and local (Ollama) AI models with streaming responses
+- **Multimodal Agents**: 
+  - **MiniCPM**: Advanced multimodal model for processing handwritten math problems and diagrams from images
+  - **DeepSeekR1**: Specialized reasoning model for step-by-step mathematical explanations and proofs
+- **Interactive UI Components**:
+  - Dynamic math workspace with chat assistant
+  - Topic navigation with node-link topic map
+  - Quiz and plan views for structured learning
+  - Student reports and mistake analysis
+  - Gamification engine with levels and badges
+- **Persistent Storage**: IndexedDB-based chat sessions with optional encryption and retention controls
+- **Security & Governance**:
+  - Backend proxy server (no client-held API keys)
+  - Policy middleware with prompt injection filtering
+  - Safety categories detection (violence, hate, self-harm, etc.)
+  - Strict mode for enhanced content filtering
+  - Auto-delete retention policies
+  - Data export/delete controls
+- **Vision Capabilities**: Image upload and processing for handwritten math problems
+- **Agentic Architecture**: Multiple specialized agents (TutorAgent, GraderAgent, KnowledgeGraph, ProactivePlanner, StudentReportGenerator)
+- **Themes**: Light/Dark mode toggle
+- **Deployment Ready**: GitHub Pages compatible (build to `dist/` folder)
 
 ### Prerequisites
 
 - **Node.js** 18+ (you have Node installed already)
 - (Optional for Local AI) **Ollama** installed and running
+- (Optional for Multimodal) Ollama models: `minicpm-v` and `deepseek-r1:7b`
 
 ### Install
 
@@ -21,13 +39,13 @@ React + Vite math tutor with:
 npm install
 ```
 
-### Configure env (required)
+### Configure Environment (Required)
 
 1. Copy `.env.example` to `.env`
 2. Fill in your own Azure OpenAI + Azure Search (RAG) values
 3. Keep keys only in `.env` (server-side)
 
-### Run (dev, full stack)
+### Run (Development, Full Stack)
 
 ```bash
 npm run dev:full
@@ -39,14 +57,16 @@ This starts:
 
 For hackathon judges cloning from GitHub, this is the recommended command.
 
-### Build (frontend)
+### Build (Frontend for Production)
 
 ```bash
 npm run build
 npm run preview
 ```
 
-### Configure AI (in-app Settings)
+Deploy the `dist/` folder to GitHub Pages or any static hosting.
+
+### Configure AI (In-App Settings)
 
 Open the app → click **⚙️ Settings**.
 
@@ -65,16 +85,23 @@ Open the app → click **⚙️ Settings**.
 ollama serve
 ```
 
-2) Pull the model:
+2) Pull the models:
 
 ```bash
-ollama pull deepseek-r1:7b
+ollama pull minicpm-v  # For multimodal image processing
+ollama pull deepseek-r1:7b  # For reasoning and explanations
 ```
 
 3) In Settings:
 - **AI Mode**: Local (Ollama)
 - **Ollama URL**: `http://localhost:11434/api/generate` (or leave default)
-- **Ollama model**: `deepseek-r1:7b`
+- **Ollama model**: Select from `minicpm-v` (multimodal) or `deepseek-r1:7b` (reasoning)
+
+#### Multimodal Features
+
+- **MiniCPM Agent**: Upload images of handwritten math problems for AI analysis and step-by-step solutions
+- **DeepSeekR1 Agent**: Advanced reasoning for complex proofs, algebraic manipulations, and conceptual explanations
+- Switch between agents in the chat interface for different problem types
 
 ### (Optional) Online RAG with Azure AI Search
 
