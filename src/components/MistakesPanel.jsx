@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { getMistakes, markMistakeCorrected } from '../store/localVault.js';
 import { TOPICS } from '../agents/KnowledgeGraph.js';
 
-export default function MistakesPanel({ topicId = null }) {
+export default function MistakesPanel({ topicId = null, onAskAI = null }) {
   const [rows, setRows] = useState([]);
 
   const load = async () => {
@@ -17,8 +17,21 @@ export default function MistakesPanel({ topicId = null }) {
 
   const topicLabel = useMemo(() => {
     if (!topicId) return null;
-    return TOPICS.find((t) => t.id === topicId)?.label || topicId;
+    const base = TOPICS.find((t) => t.id === topicId)?.label || topicId;
+    return String(base).toUpperCase();
   }, [topicId]);
+
+  const handleAskAI = (mistake) => {
+    if (onAskAI) {
+      onAskAI({
+        problem: mistake.problem,
+        description: mistake.description,
+        type: mistake.type || 'mcq',
+        difficulty: mistake.difficulty,
+        topic: topicId || mistake.topicId,
+      });
+    }
+  };
 
   return (
     <div className="mistakes-panel">
@@ -36,23 +49,36 @@ export default function MistakesPanel({ topicId = null }) {
               <div className="mistake-main">
                 <div className="mistake-desc">{m.description || m.problem || 'Mistake'}</div>
                 <div className="mistake-meta">
-                  <span className="pill">{m.topicId}</span>
+                  <span className="pill">{String(m.topicId || '').toUpperCase()}</span>
                   <span className="pill">{(m.date || '').split('T')[0]}</span>
+                  {m.type && <span className="pill">{m.type.toUpperCase()}</span>}
+                  {m.difficulty && <span className="pill difficulty">{String(m.difficulty).toUpperCase()}</span>}
                   {m.corrected && <span className="pill">Fixed</span>}
                 </div>
               </div>
-              {!m.corrected && (
-                <button
-                  className="mistake-fix"
-                  onClick={async () => {
-                    await markMistakeCorrected(m.id);
-                    await load();
-                  }}
-                  title="Mark as fixed"
-                >
-                  ✓
-                </button>
-              )}
+              <div className="mistake-actions">
+                {!m.corrected && onAskAI && (
+                  <button
+                    className="panel-btn small"
+                    onClick={() => handleAskAI(m)}
+                    title="Ask AI how to solve this mistake"
+                  >
+                    💡 Ask AI
+                  </button>
+                )}
+                {!m.corrected && (
+                  <button
+                    className="mistake-fix"
+                    onClick={async () => {
+                      await markMistakeCorrected(m.id);
+                      await load();
+                    }}
+                    title="Mark as fixed"
+                  >
+                    ✓
+                  </button>
+                )}
+              </div>
             </div>
           ))}
         </div>

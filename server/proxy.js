@@ -1,12 +1,17 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import ResponseCache from './responseCache.js';
+import { INFERENCE_PROFILES, selectInferenceProfile, getOptimizedSystemPrompt, formatOptimizedPrompt } from './inferenceOptimization.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PROXY_PORT || 8787);
 const STRICT_MODE_DEFAULT = String(process.env.STRICT_MODE || 'true').toLowerCase() === 'true';
+
+// Initialize response cache (500 entries, 1-hour TTL)
+const responseCache = new ResponseCache(500, 3600000);
 
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
@@ -95,6 +100,39 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, strictModeDefault: STRICT_MODE_DEFAULT });
 });
 
+// ========== Cache Management Endpoints ==========
+
+app.get('/api/cache/stats', (_req, res) => {
+  const stats = responseCache.getStats();
+  res.json({
+    ...stats,
+    hitRate: `~${((stats.size / stats.maxSize) * 100).toFixed(1)}% utilization`,
+  });
+});
+
+app.delete('/api/cache/clear', (_req, res) => {
+  responseCache.clear();
+  res.json({ success: true, message: 'Response cache cleared' });
+});
+
+app.get('/api/cache/entries', (_req, res) => {
+  const stats = responseCache.getStats();
+  res.json({
+    count: stats.entries.length,
+    entries: stats.entries.slice(0, 20), // Show most recent 20
+  });
+});
+
+// ========== Inference Optimization Endpoint ==========
+
+app.get('/api/inference/profiles', (_req, res) => {
+  res.json({
+    available_profiles: Object.keys(INFERENCE_PROFILES),
+    profiles: INFERENCE_PROFILES,
+    description: 'Use selectInferenceProfile(prompt) to auto-select based on complexity',
+  });
+});
+
 app.post('/api/proxy/rag/search', policyGuard, async (req, res) => {
   const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
   const apiKey = process.env.AZURE_SEARCH_KEY;
@@ -128,21 +166,58 @@ app.post('/api/proxy/rag/search', policyGuard, async (req, res) => {
 
 app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
+  const userPrompt = req.body?.prompt || '';
 
   try {
+    // ========== OPTIMIZATION 1: Check response cache ==========
+    const cachedResponse = responseCache.get(userPrompt);
+    if (cachedResponse) {
+      const cacheData = {
+        model: req.body?.model || process.env.OLLAMA_MODEL || 'deepseek-r1:7b',
+        response: cachedResponse,
+        cached: true,
+        eval_count: 0,
+        load_duration: 0,
+        prompt_eval_count: 0,
+        prompt_eval_duration: 0,
+        eval_duration: 0,
+      };
+      res.set('X-Cache', 'HIT');
+      return res.json(cacheData);
+    }
+
+    // ========== OPTIMIZATION 2: Select inference profile ==========
+    const profile = selectInferenceProfile(userPrompt);
+    const inferenceOptions = INFERENCE_PROFILES[profile] || INFERENCE_PROFILES.balanced;
+    
+    // ========== OPTIMIZATION 3: Get optimized system prompt ==========
+    const systemPrompt = getOptimizedSystemPrompt(profile);
+    const formattedPrompt = `${systemPrompt}\n\nUser: ${formatOptimizedPrompt(userPrompt, profile)}`;
+
     const body = {
       model: req.body?.model || process.env.OLLAMA_MODEL || 'deepseek-r1:7b',
-      prompt: req.body?.prompt || '',
+      prompt: formattedPrompt,
       stream: req.body?.stream !== false,
       keep_alive: req.body?.keep_alive || '10m',
-      options: req.body?.options || {},
+      options: {
+        ...inferenceOptions,
+        ...req.body?.options,  // Allow client overrides
+      },
     };
+
+    // ========== OPTIMIZATION 4: Add request timeout ==========
+    const controller = new AbortController();
+    const timeoutMs = req.body?.timeout || 25000;  // 25s timeout (instead of waiting forever)
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     const r = await fetch(ollamaUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     if (!r.ok) {
       const txt = await r.text();
@@ -153,12 +228,20 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
       const data = await r.json();
       const outPolicy = evaluatePolicy(data?.response || '', Boolean(req.body?.strictMode ?? STRICT_MODE_DEFAULT));
       if (outPolicy.blocked) return res.status(400).json(policyMessage(outPolicy, 'output'));
+      
+      // ========== OPTIMIZATION 5: Cache successful response ==========
+      if (data?.response) {
+        responseCache.set(userPrompt, data.response);
+        data.cached = false;
+      }
       return res.json(data);
     }
 
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Cache', 'MISS');
+    res.setHeader('X-Inference-Profile', profile);
 
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
@@ -194,6 +277,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
               done: true,
             };
             res.write(`${JSON.stringify(blockedChunk)}\n`);
+            responseCache.set(userPrompt, '[Blocked by safety policy]');  // Cache blocked response too
             return res.end();
           }
         }
@@ -202,9 +286,17 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
       }
     }
 
+    // ========== Cache final response after completion ==========
+    if (accumulated) {
+      responseCache.set(userPrompt, accumulated);
+    }
+
     res.end();
   } catch (err) {
-    res.status(500).json({ error: err?.message || 'Ollama proxy failure' });
+    const isTimeout = err?.name === 'AbortError';
+    const statusCode = isTimeout ? 504 : 500;
+    const errorMsg = isTimeout ? 'Inference timeout (>25s)' : err?.message || 'Ollama proxy failure';
+    res.status(statusCode).json({ error: errorMsg, timeout: isTimeout });
   }
 });
 
@@ -308,6 +400,27 @@ app.post('/api/proxy/azure/chat', policyGuard, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[proxy] running on http://localhost:${PORT}`);
+  console.log(`[cache] initialized: ${responseCache.getStats().maxSize} entries, 1-hour TTL`);
+  console.log(`[optimization] inference profiles enabled: fast/balanced/thorough`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('[proxy] SIGTERM received, shutting down gracefully...');
+  responseCache.destroy();
+  server.close(() => {
+    console.log('[proxy] server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('[proxy] SIGINT received, shutting down gracefully...');
+  responseCache.destroy();
+  server.close(() => {
+    console.log('[proxy] server closed');
+    process.exit(0);
+  });
 });

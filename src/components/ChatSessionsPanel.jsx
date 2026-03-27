@@ -13,6 +13,18 @@ export default function ChatSessionsPanel({
   const [editingId, setEditingId] = useState(null);
   const [draftTitle, setDraftTitle] = useState('');
 
+  const handleDelete = async (id) => {
+    setBusyId(id);
+    try {
+      await onDeleteSession?.(id);
+      if (String(editingId) === String(id)) {
+        setEditingId(null);
+      }
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   useEffect(() => {
     if (!editingId) return;
     const s = sessions.find((x) => String(x.id) === String(editingId));
@@ -39,10 +51,21 @@ export default function ChatSessionsPanel({
                   className="chat-session-input"
                   value={draftTitle}
                   onChange={(e) => setDraftTitle(e.target.value)}
+                  onKeyDown={async (e) => {
+                    if (e.key === 'Enter') {
+                      const next = draftTitle.trim();
+                      if (!next) return;
+                      await onRenameSession?.(s.id, next);
+                      setEditingId(null);
+                    }
+                    if (e.key === 'Escape') {
+                      setEditingId(null);
+                    }
+                  }}
                   placeholder="Chat title"
                 />
                 <button
-                  className="chat-session-del"
+                  className="chat-session-btn-icon chat-session-save"
                   title="Save"
                   onClick={async () => {
                     const next = draftTitle.trim();
@@ -66,28 +89,23 @@ export default function ChatSessionsPanel({
             )}
             {editingId !== s.id && (
               <button
-                className="chat-session-del"
+                className="chat-session-btn-icon"
                 title="Rename chat"
                 onClick={() => setEditingId(s.id)}
               >
                 ✎
               </button>
             )}
-            <button
-              className="chat-session-del"
-              title="Delete chat"
-              onClick={async () => {
-                setBusyId(s.id);
-                try {
-                  await onDeleteSession?.(s.id);
-                } finally {
-                  setBusyId(null);
-                }
-              }}
-              disabled={busyId === s.id}
-            >
-              ✕
-            </button>
+            {editingId === s.id && (
+              <button
+                className="chat-session-del"
+                title="Delete chat"
+                onClick={() => handleDelete(s.id)}
+                disabled={busyId === s.id}
+              >
+                ✕
+              </button>
+            )}
           </div>
         ))}
       </div>

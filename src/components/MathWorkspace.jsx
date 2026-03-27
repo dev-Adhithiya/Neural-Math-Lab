@@ -86,6 +86,41 @@ function isEphemeralSessionId(id) {
   return typeof id === 'string' && id.startsWith('local-');
 }
 
+function isGenericSessionTitle(title) {
+  const normalized = String(title || '').trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized === 'main chat') return true;
+  if (/^local chat(\s+\d+)?$/.test(normalized)) return true;
+  if (normalized.startsWith('chat ')) return true;
+  return false;
+}
+
+function isLowSignalPrompt(prompt) {
+  const normalized = String(prompt || '').trim().toLowerCase();
+  return /^(hi|hello|hey|yo|hola|sup|good\s+(morning|afternoon|evening|night))[\s!.?]*$/.test(normalized);
+}
+
+function buildSessionTitleFromPrompt(prompt) {
+  const cleaned = String(prompt || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return null;
+  const withoutOuterQuotes = cleaned.replace(/^["'`]+|["'`]+$/g, '');
+  if (!withoutOuterQuotes) return null;
+  if (withoutOuterQuotes.length <= 52) return withoutOuterQuotes;
+  return `${withoutOuterQuotes.slice(0, 49).trimEnd()}...`;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = String(reader.result || '');
+      resolve(result.split(',')[1] || '');
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 /**
  * MathWorkspace — Main application workspace.
  * Orchestrates all components: chat, topics, grading, graphing, reports.
@@ -303,6 +338,35 @@ export default function MathWorkspace() {
     const trimmed = String(text || '').trim();
     if (!trimmed) return;
 
+    const maybeAutoTitleFromPrompt = async (prompt) => {
+      if (!activeSessionId || isLowSignalPrompt(prompt)) return;
+
+      const priorUserCount = messages.reduce((count, m) => {
+        return m.role === 'user' ? count + 1 : count;
+      }, 0);
+      if (priorUserCount > 0) return;
+
+      const nextTitle = buildSessionTitleFromPrompt(prompt);
+      if (!nextTitle) return;
+
+      const currentSession = chatSessions.find((s) => String(s.id) === String(activeSessionId));
+      if (!currentSession || !isGenericSessionTitle(currentSession.title)) return;
+
+      if (isEphemeralMode || isEphemeralSessionId(activeSessionId)) {
+        setChatSessions((prev) => prev.map((s) => (
+          String(s.id) === String(activeSessionId) ? { ...s, title: nextTitle } : s
+        )));
+        return;
+      }
+
+      try {
+        await updateSessionTitle(activeSessionId, nextTitle);
+        setChatSessions(await getChatSessions());
+      } catch {
+        switchToEphemeralMode('auto title update failed');
+      }
+    };
+
     if (!tutorRef.current || !isTutorReady) {
       showToast('Tutor is still initializing. Please retry in a second.');
       setMessages((prev) => [...prev, {
@@ -349,6 +413,7 @@ export default function MathWorkspace() {
     const userMsg = { role: 'user', content: trimmed, id: Date.now() };
     setMessages((prev) => [...prev, userMsg]);
     setStreamingText('');
+    await maybeAutoTitleFromPrompt(trimmed);
 
     if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
       try {
@@ -459,7 +524,7 @@ export default function MathWorkspace() {
       }]);
       showToast(`Unexpected chat error: ${err?.message || 'unknown error'}`, 7000);
     }
-  }, [settings.studentName, settings.azureEndpoint, settings.azureKey, settings.azureDeployment, selectedTopic, gradingResult, refreshData, activeSessionId, messages.length, aiMode, isTutorReady, setAIMode, showToast, isEphemeralMode, switchToEphemeralMode]);
+  }, [settings.studentName, settings.azureEndpoint, settings.azureKey, settings.azureDeployment, selectedTopic, gradingResult, refreshData, activeSessionId, messages, aiMode, isTutorReady, setAIMode, showToast, isEphemeralMode, switchToEphemeralMode, chatSessions]);
 
   // ── Quick Actions ──
   const handleQuickAction = useCallback(async (actionId) => {
@@ -773,44 +838,61 @@ export default function MathWorkspace() {
         {activeView === 'quiz' && (
           <QuizView
             topicId={selectedTopic || 'polynomials'}
-            onSubmit={async ({ topicId, mcqScore, mcqTotal, solveAnswer, solveExpected }) => {
-              const solveMax = 5;
-              const solveCorrect = areMathAnswersEquivalent(solveAnswer, solveExpected);
-              const solveScore = solveCorrect ? solveMax : Math.max(1, Math.round(solveMax * 0.4));
-
+            onExtractAnswerFromPhoto={async (imageFile, questionPrompt) => {
+              const base64 = await fileToBase64(imageFile);
+              const extractionPrompt = `You are reading a student's handwritten solution for this math question:\n${questionPrompt}\n\nReturn ONLY the student's final answer text.\n- No explanation\n- No markdown\n- If answer has multiple roots, return in one line\n- If unreadable, return UNCLEAR`;
+              const extracted = await analyzeImage(base64, extractionPrompt);
+              return String(extracted || '').trim();
+            }}
+            onAskAI={(data) => {
+              const { type, question, expected, topic, difficulty } = data;
+              let prompt = '';
+              
+              if (type === 'quiz_doubt') {
+                prompt = `I just completed a quiz on ${topic}. I have some doubts and questions about the topics covered. Can you help me understand the concepts better?`;
+              } else if (type === 'solve') {
+                prompt = `I got this solving question wrong:\n\nQuestion: ${question}\n\nExpected answer: ${expected}\n\nDifficulty: ${difficulty}\n\nCan you explain step-by-step how to solve this? What was my mistake?`;
+              }
+              
+              setActiveView('chat');
+              handleSend(prompt);
+            }}
+            onSubmit={async ({ topicId, quizMode, mcqScore, mcqTotal, solveScore, solveMax, solveDetails }) => {
               const score = mcqScore + solveScore;
               const maxScore = mcqTotal + solveMax;
-              const percentage = Math.round((score / maxScore) * 100);
+              const percentage = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0;
+
+              const mcqRatio = mcqTotal > 0 ? mcqScore / mcqTotal : 1;
+              const solveRatio = solveMax > 0 ? solveScore / solveMax : 1;
 
               const stepResults = [
                 {
                   stepNumber: 1,
                   marksAwarded: mcqScore,
                   maxMarks: mcqTotal,
-                  status: mcqScore / mcqTotal >= 0.8 ? 'correct' : mcqScore / mcqTotal >= 0.5 ? 'partial' : 'incorrect',
+                  status: mcqRatio >= 0.8 ? 'correct' : mcqRatio >= 0.5 ? 'partial' : 'incorrect',
                   feedback: `MCQ score: ${mcqScore}/${mcqTotal}.`,
                 },
                 {
                   stepNumber: 2,
                   marksAwarded: solveScore,
                   maxMarks: solveMax,
-                  status: solveCorrect ? 'correct' : 'partial',
-                  feedback: solveCorrect
-                    ? 'Solve question: correct final answer.'
-                    : `Solve question: partial credit awarded. Expected a result equivalent to ${solveExpected}.`,
+                  status: solveRatio >= 0.8 ? 'correct' : solveRatio >= 0.5 ? 'partial' : 'incorrect',
+                  feedback: `Solving questions: ${solveScore}/${solveMax}.`,
                 },
-              ];
+              ].filter((s) => s.maxMarks > 0);
 
               const grade = percentage >= 90 ? 'A+' : percentage >= 80 ? 'A' : percentage >= 70 ? 'B' : percentage >= 60 ? 'C' : percentage >= 50 ? 'D' : 'F';
               const nextResult = {
                 topicId,
+                quizMode,
                 score,
                 maxScore,
                 percentage,
                 stepResults,
-                feedback: `Quiz result: ${score}/${maxScore}. ${solveCorrect ? 'Great solving accuracy.' : 'Review the solving step for full credit.'}`,
+                feedback: `Quiz result: ${score}/${maxScore}. ${solveRatio >= 0.8 ? 'Excellent solving accuracy.' : 'Review the solving steps for improvement.'}`,
                 grade,
-                mistakeTypes: solveCorrect ? [] : ['final_answer_mismatch'],
+                mistakeTypes: solveRatio === 1 ? [] : ['incomplete_solving'],
               };
 
               try {
@@ -884,7 +966,26 @@ export default function MathWorkspace() {
         )}
 
         {activeView === 'mistakes' && (
-          <MistakesPanel topicId={selectedTopic || null} />
+          <MistakesPanel 
+            topicId={selectedTopic || null}
+            onAskAI={(mistake) => {
+              const { problem, description, type, difficulty, topic } = mistake;
+              const safeProblem = String(problem || '').replace(/\s+/g, ' ').trim();
+              const safeDescription = String(description || '').replace(/\s+/g, ' ').trim();
+              let prompt = '';
+              
+              if (type === 'mcq') {
+                prompt = `Explain this MCQ mistake clearly and concisely.\n\nQuestion: ${safeProblem}\nMy mistake: ${safeDescription}\n\nRules:\n- Do NOT guess what the student was thinking.\n- Do NOT add fictional context or names.\n- Do NOT include self-reflection, internal reasoning, or "question for student" text.\n- Give only: correct option, why it is correct, and one short method to avoid this mistake.`;
+              } else if (type === 'solve') {
+                prompt = `Explain this long-answer mistake step by step.\n\nQuestion: ${safeProblem}\nMy mistake: ${safeDescription}\nDifficulty: ${difficulty}\n\nRules:\n- Do NOT guess what the student was thinking.\n- No fictional context.\n- Do NOT include self-reflection or chain-of-thought style text.\n- Keep response focused on math steps and correction only.`;
+              } else {
+                prompt = `Explain this mistake with only factual math guidance.\n\nQuestion: ${safeProblem}\nMistake: ${safeDescription}\n\nRules:\n- No speculative student psychology.\n- No internal reasoning text.\n- Provide direct correction steps only.`;
+              }
+              
+              setActiveView('chat');
+              handleSend(prompt);
+            }}
+          />
         )}
 
         {activeView === 'chat' && (

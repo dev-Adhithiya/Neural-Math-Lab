@@ -29,6 +29,26 @@ export default function ChatAssistant({
   const [input, setInput] = useState('');
   const [uploadError, setUploadError] = useState('');
   const [pendingImage, setPendingImage] = useState(null);
+  const [welcomeCopy] = useState(() => {
+    const hour = new Date().getHours();
+    const dayPart = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : hour < 21 ? 'evening' : 'night';
+    const greetingPool = {
+      morning: ['Good morning', 'Top of the morning', 'Bright morning'],
+      afternoon: ['Good afternoon', 'Hope your afternoon is going well', 'Happy afternoon'],
+      evening: ['Good evening', 'Hope your evening is going well', 'Lovely evening'],
+      night: ['Good night', 'Late-night math session', 'Quiet night for learning'],
+    };
+    const subtitlePool = [
+      "I'm Phi, your AI Math Tutor. What would you like to solve today?",
+      "I'm Phi, your AI Math Tutor. Ready for practice, quiz, or doubt-solving.",
+      "I'm Phi, your AI Math Tutor. Let's make today's math feel easy.",
+    ];
+
+    const greetings = greetingPool[dayPart] || greetingPool.morning;
+    const greeting = greetings[Math.floor(Math.random() * greetings.length)] || 'Hello';
+    const subtitle = subtitlePool[Math.floor(Math.random() * subtitlePool.length)] || subtitlePool[0];
+    return { greeting, subtitle };
+  });
   const messagesContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -125,8 +145,8 @@ export default function ChatAssistant({
         {messages.length === 0 && !isStreaming && (
           <div className="chat-welcome">
             <div className="welcome-icon">👋</div>
-            <h3>Hello, {studentName}!</h3>
-            <p>I'm your Senior Mathematics Teacher. What can I help you with today?</p>
+            <h3>{welcomeCopy.greeting}, {studentName}!</h3>
+            <p>{welcomeCopy.subtitle}</p>
             <div className="quick-actions">
               {quickActions.map((action) => (
                 <button
