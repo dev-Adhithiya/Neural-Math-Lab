@@ -25,7 +25,7 @@ Our system leverages a collaborative agentic architecture:
 - **VisionModule**: Handles image uploads, extracts text, formulas, and visual context allowing the main agent to "see" math problems.
 
 #### Agent Workflow Diagram
-*(Upload your architectural diagram or agent workflow image to your repository and replace the link below)*
+
 
 
 <img width="1408" height="768" alt="Gemini_Generated_Image_d2uwhvd2uwhvd2uw" src="https://github.com/user-attachments/assets/a135fb62-fd3b-4554-be8a-327eb18290ab" />
