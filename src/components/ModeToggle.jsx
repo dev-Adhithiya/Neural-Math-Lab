@@ -15,34 +15,8 @@ export default function ModeToggle({
   aiMode = 'online',
   onAIModeChange,
 }) {
-  // In GREETING mode, don't show the tutoring mode toggle
-  const showTutorToggle = tutorMode !== 'GREETING';
-
   return (
     <div className="mode-toggle">
-      {/* Tutor Mode - only show in TEACHING/SOLVER modes */}
-      {showTutorToggle && (
-        <div className="toggle-group">
-          <label className="toggle-label">Mode</label>
-          <div className="toggle-switch">
-            <button
-              className={`toggle-btn ${tutorMode === 'TEACHING' ? 'active' : ''}`}
-              onClick={() => onTutorModeChange('TEACHING')}
-              title="Socratic hints, guided learning"
-            >
-              🎓 Teach
-            </button>
-            <button
-              className={`toggle-btn ${tutorMode === 'SOLVER' ? 'active' : ''}`}
-              onClick={() => onTutorModeChange('SOLVER')}
-              title="Direct solutions with steps"
-            >
-              ⚡ Solve
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* AI Mode */}
       <div className="toggle-group">
         <label className="toggle-label">AI</label>

@@ -14,7 +14,7 @@
 
 const DEFAULTS = {
   azureApiVersion: '2024-02-01',
-  maxTokens: 2048,
+  maxTokens: 16384,
   temperature: 0.7,
 
   // Local (Ollama)
@@ -100,8 +100,8 @@ export class BrainSwitch {
 
     if (route === 'ollama') {
       const prompt = this._messagesToPrompt(messages, {
-        maxMessages: 12,
-        maxChars: 12000,
+        maxMessages: 100,
+        maxChars: 64000,
       });
       yield* this._streamOllama(prompt, opts);
       return;
@@ -161,8 +161,8 @@ export class BrainSwitch {
   }
 
   _messagesToPrompt(messages, opts = {}) {
-    const maxMessages = Number.isFinite(opts.maxMessages) ? opts.maxMessages : 12;
-    const maxChars = Number.isFinite(opts.maxChars) ? opts.maxChars : 12000;
+    const maxMessages = Number.isFinite(opts.maxMessages) ? opts.maxMessages : 100;
+    const maxChars = Number.isFinite(opts.maxChars) ? opts.maxChars : 64000;
 
     const rows = (messages || []).slice(-maxMessages);
     let prompt = rows
@@ -306,10 +306,18 @@ export class BrainSwitch {
 
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      if (value) {
+        buffer += decoder.decode(value, { stream: true });
+      }
+
       const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      // If we are done, we want to process the last element even if it has no newline.
+      if (done) {
+        // If there's no trailing newline, the last element is the remaining buffer.
+        buffer = ''; 
+      } else {
+        buffer = lines.pop() || '';
+      }
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
@@ -323,6 +331,8 @@ export class BrainSwitch {
           // ignore partial chunks
         }
       }
+      
+      if (done) break;
     }
   }
 
@@ -418,11 +428,16 @@ export class BrainSwitch {
 
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (value) {
+        buffer += decoder.decode(value, { stream: true });
+      }
 
-      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      if (done) {
+        buffer = '';
+      } else {
+        buffer = lines.pop() || '';
+      }
 
       for (const line of lines) {
         const trimmed = line.trim();
@@ -432,10 +447,12 @@ export class BrainSwitch {
           if (json?.response) yield json.response;
           if (json?.done) return;
         } catch {
-          // If Ollama sends partial JSON line, keep buffering.
-          buffer = `${trimmed}\n${buffer}`;
+          // If JSON parse fails, it's corrupt data from proxy; ignore or log
+          console.warn("Mangled JSON chunk received:", trimmed);
         }
       }
+      
+      if (done) break;
     }
   }
 }

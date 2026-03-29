@@ -86,16 +86,16 @@ async function benchmarkHealthCheck() {
  * Test Ollama inference endpoint
  */
 async function benchmarkOllamaInference() {
-  console.log('\n🧠 Benchmarking Ollama Inference Endpoint...');
-  
-  const payload = {
-    model: process.env.OLLAMA_MODEL || 'deepseek-r1:7b',
-    prompt: 'What is 2 + 2? Answer briefly.',
-    stream: false,
-    keep_alive: '10m',
-  };
+  console.log('\n🧠 Benchmarking Ollama Inference Endpoint (Uncached)...');
   
   for (let i = 0; i < ITERATIONS; i++) {
+    const payload = {
+      model: process.env.OLLAMA_MODEL || 'deepseek-r1:7b', // Target deepseek-r1
+      prompt: `What is ${Math.floor(Math.random() * 100)} + ${Math.floor(Math.random() * 100)}? Answer briefly with ONLY the number.`,
+      stream: false,
+      keep_alive: '10m',
+      options: { num_predict: 20 }
+    };
     try {
       const result = await makeRequest({
         hostname: PROXY_HOST,
@@ -114,6 +114,38 @@ async function benchmarkOllamaInference() {
     } catch (err) {
       console.error(`  Iteration ${i + 1}: ERROR - ${err.message}`);
     }
+  }
+
+  console.log('\n🧠 Benchmarking Ollama Inference Endpoint (Cached)...');
+  const cachedPayload = {
+    model: process.env.OLLAMA_MODEL || 'deepseek-r1:7b',
+    prompt: 'What is the sum of angles in a triangle?',
+    stream: false,
+    keep_alive: '10m',
+  };
+  // Prime cache
+  await makeRequest({
+    hostname: PROXY_HOST,
+    port: PROXY_PORT,
+    path: '/api/proxy/ollama/chat',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  }, cachedPayload);
+  
+  for (let i = 0; i < 5; i++) {
+    try {
+      const result = await makeRequest({
+        hostname: PROXY_HOST,
+        port: PROXY_PORT,
+        path: '/api/proxy/ollama/chat',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }, cachedPayload);
+      
+      if (result.statusCode === 200) {
+        console.log(`  Cached Iteration ${i + 1}: ${result.latencyMs.toFixed(2)}ms (${result.dataSize} bytes)`);
+      }
+    } catch (err) { }
   }
 }
 

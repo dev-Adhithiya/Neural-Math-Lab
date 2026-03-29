@@ -3,27 +3,19 @@ import ChatAssistant from './ChatAssistant.jsx';
 import TopicSelector from './TopicSelector.jsx';
 import ModeToggle from './ModeToggle.jsx';
 import LevelBadge from './LevelBadge.jsx';
-import MarksDashboard from './MarksDashboard.jsx';
-import GraphPlotter from './GraphPlotter.jsx';
-import StudentReport from './StudentReport.jsx';
 import SidebarNav from './SidebarNav.jsx';
-import TopicMap from './TopicMap.jsx';
 import ChatSessionsPanel from './ChatSessionsPanel.jsx';
-import QuizView from './QuizView.jsx';
-import PlanView from './PlanView.jsx';
-import MistakesPanel from './MistakesPanel.jsx';
+import WorkflowCommandPalette from './WorkflowCommandPalette.jsx';
 import { useAI } from '../hooks/useAI.js';
 import { useSettings } from '../context/SettingsContext.jsx';
-import { TutorAgent, generateGreeting } from '../agents/TutorAgent.js';
-import { gradeWork } from '../agents/GraderAgent.js';
+import { TutorAgent } from '../agents/TutorAgent.js';
 import { getAnnotatedTopics, buildProgressMap } from '../agents/KnowledgeGraph.js';
 import { generateSessionPlan, planToMessage } from '../agents/ProactivePlanner.js';
 import { generateReport } from '../agents/StudentReportGenerator.js';
 import { calculateLevel, awardParticipation, awardStepByStep, getCurrentLevel } from '../engine/GamificationEngine.js';
 import { plotMathFunction, extractGraphCommands } from '../engine/DynamicGraphing.js';
-import { simplify } from 'mathjs';
 import { processHandwriting } from '../vision/VisionModule.js';
-import { extractMathWithMoondream, preprocessForOcr, bridgeToPhi3, classifyImageWithMoondream } from '../vision/ImageDispatcher.js';
+import { extractMathWithMoondream, preprocessForOcr } from '../vision/ImageDispatcher.js';
 import { TOPICS, getTopic, getPrerequisiteChain } from '../agents/KnowledgeGraph.js';
 import {
   getProfile, getPrerequisiteProgress, getExamHistory,
@@ -32,38 +24,13 @@ import {
   resetAllData,
 } from '../store/localVault.js';
 
-function normalizeMathAnswer(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/\$+/g, '')
-    .replace(/\s+/g, '')
-    .replace(/×/g, '*')
-    .replace(/−/g, '-')
-    .replace(/\^\{([^}]+)\}/g, '^$1');
-}
-
-function areMathAnswersEquivalent(studentAnswer, expectedAnswer) {
-  const student = normalizeMathAnswer(studentAnswer);
-  const expected = normalizeMathAnswer(expectedAnswer);
-  if (!student || !expected) return false;
-  if (student === expected) return true;
-
-  try {
-    const diff = simplify(`(${student})-(${expected})`);
-    const simplifiedDiff = normalizeMathAnswer(diff.toString());
-    if (simplifiedDiff === '0') return true;
-
-    const compiled = diff.compile();
-    const sampleXs = [-3, -1, 0, 1, 2, 4];
-    const allCloseToZero = sampleXs.every((x) => {
-      const v = Number(compiled.evaluate({ x }));
-      return Number.isFinite(v) && Math.abs(v) < 1e-8;
-    });
-    return allCloseToZero;
-  } catch {
-    return false;
-  }
-}
+const TopicMap = React.lazy(() => import('./TopicMap.jsx'));
+const QuizView = React.lazy(() => import('./QuizView.jsx'));
+const PlanView = React.lazy(() => import('./PlanView.jsx'));
+const MistakesPanel = React.lazy(() => import('./MistakesPanel.jsx'));
+const StudentReport = React.lazy(() => import('./StudentReport.jsx'));
+const GraphPlotter = React.lazy(() => import('./GraphPlotter.jsx'));
+const MarksDashboard = React.lazy(() => import('./MarksDashboard.jsx'));
 
 function getTopTopicsFromHistory(exams = []) {
   const map = new Map();
@@ -121,6 +88,84 @@ function fileToBase64(file) {
   });
 }
 
+function balanceLatexAndMarkdown(text) {
+  let safe = String(text || '').trim();
+  if (!safe) return '';
+
+  const fenceCount = (safe.match(/```/g) || []).length;
+  if (fenceCount % 2 !== 0) {
+    safe += '\n```';
+  }
+
+  const blockCount = (safe.match(/\$\$/g) || []).length;
+  if (blockCount % 2 !== 0) {
+    safe += '\n$$';
+  }
+
+  const withoutBlocks = safe.replace(/\$\$/g, '');
+  const inlineCount = (withoutBlocks.match(/(?<!\\)\$/g) || []).length;
+  if (inlineCount % 2 !== 0) {
+    safe += '$';
+  }
+
+  return safe;
+}
+
+function finalizeAssistantText(rawText) {
+  return balanceLatexAndMarkdown(String(rawText || '').replace(/\n{3,}/g, '\n\n'));
+}
+
+const WORKFLOW_PRESETS = [
+  {
+    id: 'warmup',
+    label: 'Warmup 5m',
+    icon: '🔥',
+    description: 'Fast refresh before deeper study',
+    tutorMode: 'TEACHING',
+    prompt: 'Give me a 5-minute warmup with 2 easy questions and one confidence booster tip.',
+    nextView: 'chat',
+  },
+  {
+    id: 'deep',
+    label: 'Deep Learn',
+    icon: '🧠',
+    description: 'Concept to mastery in one flow',
+    tutorMode: 'TEACHING',
+    prompt: 'Run a deep learning session: explain concept, check understanding, then give one challenge question.',
+    nextView: 'chat',
+  },
+  {
+    id: 'exam',
+    label: 'Exam Sprint',
+    icon: '⚡',
+    description: 'Timed pressure practice',
+    tutorMode: 'SOLVER',
+    prompt: 'I want a timed exam sprint. Give me one medium and one hard question with strict scoring criteria.',
+    nextView: 'quiz',
+  },
+  {
+    id: 'recover',
+    label: 'Mistake Recovery',
+    icon: '🩹',
+    description: 'Fix weak areas quickly',
+    tutorMode: 'TEACHING',
+    prompt: 'Create a targeted recovery drill from my recent mistakes and explain common traps.',
+    nextView: 'mistakes',
+  },
+];
+
+const VIEW_LABELS = {
+  chat: 'Chat',
+  quiz: 'Quiz',
+  plan: 'Plan',
+  prereq: 'Prerequisites',
+  report: 'Report',
+  map: 'Topic Map',
+  mistakes: 'Mistakes',
+};
+
+const VIEW_LOADER = <div className="view-loader">Loading view...</div>;
+
 /**
  * MathWorkspace — Main application workspace.
  * Orchestrates all components: chat, topics, grading, graphing, reports.
@@ -142,9 +187,10 @@ export default function MathWorkspace() {
   const [report, setReport] = useState(null);
   const [showReport, setShowReport] = useState(false);
   const [showSidebar, setShowSidebar] = useState(true);
-  const [imagePreview, setImagePreview] = useState(null);
   const [isProcessingImage, setIsProcessingImage] = useState(false);
   const [activeView, setActiveView] = useState('chat'); // chat | quiz | plan | prereq | report | map | mistakes
+  const [displayView, setDisplayView] = useState('chat');
+  const [viewPhase, setViewPhase] = useState('in');
   const [chatSessions, setChatSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [ephemeralMessagesBySession, setEphemeralMessagesBySession] = useState({});
@@ -153,6 +199,15 @@ export default function MathWorkspace() {
   const [toast, setToast] = useState('');
   const [isTutorReady, setIsTutorReady] = useState(false);
   const [sidePrompt, setSidePrompt] = useState('');
+  const [workflowStatus, setWorkflowStatus] = useState('Idle');
+  const [activeWorkflowId, setActiveWorkflowId] = useState(null);
+  const [focusMinutes, setFocusMinutes] = useState(15);
+  const [focusRemaining, setFocusRemaining] = useState(15 * 60);
+  const [focusRunning, setFocusRunning] = useState(false);
+  const [coachNudge, setCoachNudge] = useState('');
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState('');
+  const streamingBufferRef = useRef('');
 
   const showToast = useCallback((message, duration = 4600) => {
     setToast(message);
@@ -178,11 +233,136 @@ export default function MathWorkspace() {
   // ── AI Hook ──
   const { mode: aiMode, setMode: setAIModeInternal, isStreaming, streamChat, analyzeImage, routeBadge, abort } = useAI(settings);
   const topTopics = React.useMemo(() => getTopTopicsFromHistory(examHistory), [examHistory]);
+  const momentumScore = React.useMemo(() => {
+    const msgPoints = Math.min(40, messages.length * 2);
+    const examPoints = Math.min(40, examHistory.length * 6);
+    const topicPoints = selectedTopic ? 20 : 0;
+    return Math.min(100, msgPoints + examPoints + topicPoints);
+  }, [messages.length, examHistory.length, selectedTopic]);
+  const dynamicSuggestions = React.useMemo(() => {
+    const topicLabel = selectedTopic ? (getTopic(selectedTopic)?.label || selectedTopic) : 'my current level';
+    const byView = {
+      quiz: [
+        `Give me a rapid error analysis for my last ${topicLabel} quiz.`,
+        `Generate one exam-style ${topicLabel} problem with marking rubric.`,
+        `Create a 10-minute revision sprint for ${topicLabel}.`,
+      ],
+      mistakes: [
+        `Turn my top mistakes into a correction checklist for ${topicLabel}.`,
+        'Give me 3 trap questions based on my common errors.',
+        `Teach me a quick verification method to avoid mistakes in ${topicLabel}.`,
+      ],
+      map: [
+        `Build me a path from basics to advanced ${topicLabel}.`,
+        'What topic should I unlock next and why?',
+        'Give me a bridge lesson between my current topic and the next prerequisite.',
+      ],
+      chat: [
+        `Give me 3 practice problems for ${topicLabel}.`,
+        'Explain the last concept in a simpler way.',
+        `Challenge me with one hard ${topicLabel} problem and hints only.`,
+      ],
+    };
+    return byView[activeView] || byView.chat;
+  }, [activeView, selectedTopic]);
+
+  const navigateToView = useCallback((view) => {
+    setActiveView(view);
+    if (view === 'report') setShowReport(true);
+  }, []);
+
+  const commandItems = React.useMemo(() => {
+    const workflowCommands = WORKFLOW_PRESETS.map((preset) => ({
+      id: `workflow:${preset.id}`,
+      label: `${preset.icon} ${preset.label}`,
+      group: 'Workflow',
+      hint: preset.description,
+      kind: 'workflow',
+      value: preset.id,
+    }));
+
+    const viewCommands = Object.entries(VIEW_LABELS).map(([id, label]) => ({
+      id: `view:${id}`,
+      label: `Open ${label}`,
+      group: 'Views',
+      kind: 'view',
+      value: id,
+    }));
+
+    const actionCommands = [
+      {
+        id: 'action:focus',
+        label: 'Toggle Focus Sprint',
+        group: 'Actions',
+        hint: 'Start or pause the current sprint timer',
+        kind: 'action',
+        value: 'focus',
+      },
+      {
+        id: 'action:practice',
+        label: 'Send: Practice now',
+        group: 'Actions',
+        hint: 'Pushes a practice prompt into chat',
+        kind: 'action',
+        value: 'practice',
+      },
+      {
+        id: 'action:simple',
+        label: 'Send: Simpler explanation',
+        group: 'Actions',
+        hint: 'Asks tutor to simplify current concept',
+        kind: 'action',
+        value: 'simple',
+      },
+    ];
+
+    return [...workflowCommands, ...viewCommands, ...actionCommands];
+  }, []);
 
   const setAIMode = useCallback((nextMode) => {
     setAIModeInternal(nextMode);
     updateSettings({ aiMode: nextMode });
   }, [setAIModeInternal, updateSettings]);
+
+  useEffect(() => {
+    if (!focusRunning) return;
+    const timer = setInterval(() => {
+      setFocusRemaining((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer);
+          setFocusRunning(false);
+          setWorkflowStatus('Focus sprint completed');
+          showToast('⏱ Focus sprint done. Time for a quick recap!', 6000);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [focusRunning, showToast]);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      const isLauncher = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k';
+      if (!isLauncher) return;
+      event.preventDefault();
+      setIsCommandPaletteOpen(true);
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    if (activeView === displayView) return;
+    setViewPhase('out');
+    const timer = setTimeout(() => {
+      setDisplayView(activeView);
+      setViewPhase('in');
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [activeView, displayView]);
 
   // ── Tutor Agent ──
   const tutorRef = useRef(null);
@@ -337,6 +517,10 @@ export default function MathWorkspace() {
   const handleSend = useCallback(async (text) => {
     const trimmed = String(text || '').trim();
     if (!trimmed) return;
+    if (isStreaming || isProcessingImage) {
+      showToast('Please wait until the current response is complete.', 2200);
+      return;
+    }
 
     const maybeAutoTitleFromPrompt = async (prompt) => {
       if (!activeSessionId || isLowSignalPrompt(prompt)) return;
@@ -413,6 +597,7 @@ export default function MathWorkspace() {
     const userMsg = { role: 'user', content: trimmed, id: Date.now() };
     setMessages((prev) => [...prev, userMsg]);
     setStreamingText('');
+    streamingBufferRef.current = '';
     await maybeAutoTitleFromPrompt(trimmed);
 
     if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
@@ -441,10 +626,18 @@ export default function MathWorkspace() {
         aiMode,
       }, {
         onToken: (token) => {
+          streamingBufferRef.current += token;
           setStreamingText((prev) => prev + token);
         },
-        onDone: async (fullText) => {
-          const assistantMsg = { role: 'assistant', content: fullText, id: Date.now() + 1 };
+        onDone: async (fullText, meta = {}) => {
+          const finalText = finalizeAssistantText(fullText);
+          if (!finalText) {
+            setStreamingText('');
+            streamingBufferRef.current = '';
+            return;
+          }
+
+          const assistantMsg = { role: 'assistant', content: finalText, id: Date.now() + 1 };
 
           // Sync the tutorMode with the TutorAgent's internal mode
           if (tutorRef.current) {
@@ -456,7 +649,7 @@ export default function MathWorkspace() {
           }
 
           // Check for graphs
-          const graphEqs = extractGraphCommands(fullText);
+          const graphEqs = extractGraphCommands(finalText);
           if (graphEqs.length > 0) {
             const data = plotMathFunction(graphEqs[0]);
             setChartData(data);
@@ -475,9 +668,10 @@ export default function MathWorkspace() {
 
           setMessages((prev) => [...prev, assistantMsg]);
           setStreamingText('');
+          streamingBufferRef.current = '';
           if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
             try {
-              await saveChatMessage({ role: 'assistant', content: fullText, sessionId: activeSessionId });
+              await saveChatMessage({ role: 'assistant', content: finalText, sessionId: activeSessionId });
               await updateSessionTimestamp(activeSessionId);
             } catch {
               switchToEphemeralMode('saving assistant message failed');
@@ -488,6 +682,9 @@ export default function MathWorkspace() {
           } catch {
             // Non-blocking refresh failure
           }
+          if (meta.aborted) {
+            showToast('Response stopped. Partial answer saved.', 2600);
+          }
         },
         onError: (err) => {
           const msg = String(err?.message || '');
@@ -495,19 +692,27 @@ export default function MathWorkspace() {
             || msg.toLowerCase().includes('aborted')
             || msg.toLowerCase().includes('abort');
 
+          if (isAborted) {
+            const partial = finalizeAssistantText(streamingBufferRef.current);
+            if (partial) {
+              setMessages((prev) => [...prev, { role: 'assistant', content: partial, id: Date.now() + 1 }]);
+            }
+            setStreamingText('');
+            streamingBufferRef.current = '';
+            showToast('Response stopped. Partial answer saved.', 2600);
+            return;
+          }
+
           const errorMsg = {
             role: 'assistant',
-            content: isAborted
-              ? '⏹ Response stopped.'
-              : `⚠️ Error: ${err.message}. Please open Settings (⚙️) and verify your provider and model settings.`,
+            content: `⚠️ Error: ${err.message}. Please open Settings (⚙️) and verify your provider and model settings.`,
             id: Date.now() + 1,
           };
           setMessages((prev) => [...prev, errorMsg]);
           setStreamingText('');
+          streamingBufferRef.current = '';
 
-          if (!isAborted) {
-            showToast(`AI error: ${err.message}. Check Settings and try again.`, 7600);
-          }
+          showToast(`AI error: ${err.message}. Check Settings and try again.`, 7600);
         },
         onGraphDetected: (equation) => {
           const data = plotMathFunction(equation);
@@ -524,13 +729,13 @@ export default function MathWorkspace() {
       }]);
       showToast(`Unexpected chat error: ${err?.message || 'unknown error'}`, 7000);
     }
-  }, [settings.studentName, settings.azureEndpoint, settings.azureKey, settings.azureDeployment, selectedTopic, gradingResult, refreshData, activeSessionId, messages, aiMode, isTutorReady, setAIMode, showToast, isEphemeralMode, switchToEphemeralMode, chatSessions]);
+  }, [settings.studentName, settings.azureEndpoint, settings.azureKey, settings.azureDeployment, selectedTopic, gradingResult, refreshData, activeSessionId, messages, aiMode, isTutorReady, setAIMode, showToast, isEphemeralMode, switchToEphemeralMode, chatSessions, isStreaming, isProcessingImage]);
 
   // ── Quick Actions ──
   const handleQuickAction = useCallback(async (actionId) => {
     switch (actionId) {
       case 'plan': {
-        setActiveView('plan');
+        navigateToView('plan');
         const plan = await generateSessionPlan();
         const planMsg = planToMessage(plan);
         const msg = { role: 'assistant', content: planMsg, id: Date.now() };
@@ -538,7 +743,7 @@ export default function MathWorkspace() {
         break;
       }
       case 'learn':
-        setActiveView('chat');
+        navigateToView('chat');
         setShowSidebar(true);
         const learnMsg = {
           role: 'assistant',
@@ -548,15 +753,15 @@ export default function MathWorkspace() {
         setMessages((prev) => [...prev, learnMsg]);
         break;
       case 'prerequisites':
-        setActiveView('prereq');
+        navigateToView('prereq');
         handleSend('What prerequisites do I need to learn Calculus? Show me the full path.');
         break;
       case 'quiz':
-        setActiveView('quiz');
+        navigateToView('quiz');
         handleSend('Give me a quiz on ' + (selectedTopic || 'a topic I should practice') + '.');
         break;
       case 'report': {
-        setActiveView('report');
+        navigateToView('report');
         const rpt = await generateReport();
         setReport(rpt);
         setShowReport(true);
@@ -565,10 +770,73 @@ export default function MathWorkspace() {
       default:
         break;
     }
-  }, [selectedTopic, handleSend]);
+  }, [selectedTopic, handleSend, navigateToView]);
+
+  const runWorkflowPreset = useCallback((presetId) => {
+    const preset = WORKFLOW_PRESETS.find((item) => item.id === presetId);
+    if (!preset) return;
+
+    setActiveWorkflowId(preset.id);
+    setWorkflowStatus(`${preset.label} active`);
+    setTutorMode(preset.tutorMode);
+    navigateToView(preset.nextView);
+
+    if (preset.id === 'warmup') {
+      setFocusMinutes(5);
+      setFocusRemaining(5 * 60);
+      setFocusRunning(true);
+    }
+
+    if (preset.id === 'exam') {
+      setFocusMinutes(15);
+      setFocusRemaining(15 * 60);
+      setFocusRunning(true);
+    }
+
+    handleSend(preset.prompt);
+  }, [handleSend, navigateToView]);
+
+  const focusTimeLabel = React.useMemo(() => {
+    const mm = String(Math.floor(focusRemaining / 60)).padStart(2, '0');
+    const ss = String(focusRemaining % 60).padStart(2, '0');
+    return `${mm}:${ss}`;
+  }, [focusRemaining]);
+
+  const handleCommandRun = useCallback((command) => {
+    if (!command) return;
+
+    if (command.kind === 'workflow') {
+      runWorkflowPreset(command.value);
+      return;
+    }
+
+    if (command.kind === 'view') {
+      navigateToView(command.value);
+      return;
+    }
+
+    if (command.kind === 'action') {
+      if (command.value === 'focus') {
+        setFocusRunning((value) => !value);
+      }
+      if (command.value === 'practice') {
+        handleSend('Give me 3 practice problems for my current level.');
+        navigateToView('chat');
+      }
+      if (command.value === 'simple') {
+        handleSend('Explain the last concept in a simpler way.');
+        navigateToView('chat');
+      }
+    }
+  }, [handleSend, navigateToView, runWorkflowPreset]);
 
   // ── Image Upload (OCR) Pipeline ──
   const handleSendWithImage = useCallback(async (text, file) => {
+    if (isStreaming || isProcessingImage) {
+      showToast('Please wait until the current response is complete.', 2200);
+      return;
+    }
+
     const trimmed = String(text || '').trim();
     const previewUrl = URL.createObjectURL(file);
     
@@ -578,6 +846,7 @@ export default function MathWorkspace() {
     setMessages((prev) => [...prev, userMsg]);
     setIsProcessingImage(true);
     setStreamingText(''); // Empty string shows the CSS typing indicator dots instead of fake text
+    streamingBufferRef.current = '';
 
     try {
       const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
@@ -656,12 +925,20 @@ export default function MathWorkspace() {
         aiMode,
       }, {
         onToken: (token) => {
+          streamingBufferRef.current += token;
           setStreamingText((prev) => prev + token);
         },
-        onDone: async (fullText) => {
-          const assistantMsg = { role: 'assistant', content: fullText, id: Date.now() + 1 };
+        onDone: async (fullText, meta = {}) => {
+          const finalText = finalizeAssistantText(fullText);
+          if (!finalText) {
+            setStreamingText('');
+            streamingBufferRef.current = '';
+            return;
+          }
+
+          const assistantMsg = { role: 'assistant', content: finalText, id: Date.now() + 1 };
           
-          const graphEqs = extractGraphCommands(fullText);
+          const graphEqs = extractGraphCommands(finalText);
           if (graphEqs.length > 0) {
             const data = plotMathFunction(graphEqs[0]);
             setChartData(data);
@@ -679,9 +956,10 @@ export default function MathWorkspace() {
 
           setMessages((prev) => [...prev, assistantMsg]);
           setStreamingText('');
+          streamingBufferRef.current = '';
           if (activeSessionId && !(isEphemeralMode || isEphemeralSessionId(activeSessionId))) {
             try {
-              await saveChatMessage({ role: 'assistant', content: fullText, sessionId: activeSessionId });
+              await saveChatMessage({ role: 'assistant', content: finalText, sessionId: activeSessionId });
               await updateSessionTimestamp(activeSessionId);
             } catch {
               switchToEphemeralMode('saving image assistant response failed');
@@ -692,9 +970,33 @@ export default function MathWorkspace() {
           } catch {
             // Non-blocking refresh failure
           }
+          if (meta.aborted) {
+            showToast('Response stopped. Partial answer saved.', 2600);
+          }
         },
         onError: (err) => {
+          const msg = String(err?.message || '');
+          const isAborted = err?.name === 'AbortError'
+            || msg.toLowerCase().includes('aborted')
+            || msg.toLowerCase().includes('abort');
+
+          if (isAborted) {
+            const partial = finalizeAssistantText(streamingBufferRef.current);
+            if (partial) {
+              setMessages((prev) => [...prev, {
+                role: 'assistant',
+                content: partial,
+                id: Date.now() + 1,
+              }]);
+            }
+            setStreamingText('');
+            streamingBufferRef.current = '';
+            showToast('Response stopped. Partial answer saved.', 2600);
+            return;
+          }
+
           setStreamingText('');
+          streamingBufferRef.current = '';
           setMessages((prev) => [...prev, {
             role: 'assistant',
             content: `⚠️ Error: ${err.message}`,
@@ -707,6 +1009,7 @@ export default function MathWorkspace() {
     } catch (err) {
       console.error("Pipeline Failed:", err);
       setStreamingText('');
+      streamingBufferRef.current = '';
       setMessages((prev) => [...prev, { 
         role: 'assistant', 
         content: "Something went wrong processing that image. Let's try again.",
@@ -715,14 +1018,14 @@ export default function MathWorkspace() {
     } finally {
       setIsProcessingImage(false);
     }
-  }, [analyzeImage, settings.aiMode, settings.ollamaUrl, activeSessionId, selectedTopic, gradingResult, refreshData, aiMode, isEphemeralMode, switchToEphemeralMode]);
+  }, [analyzeImage, settings.aiMode, settings.ollamaUrl, activeSessionId, selectedTopic, gradingResult, refreshData, aiMode, isEphemeralMode, switchToEphemeralMode, isStreaming, isProcessingImage, showToast]);
 
   // ── Topic Selection ──
   const handleTopicSelect = useCallback((topicId) => {
     setSelectedTopic(topicId);
-    setActiveView('chat');
+    navigateToView('chat');
     handleSend(`I want to learn about ${topicId.replace(/-/g, ' ')}. Let's start!`);
-  }, [handleSend]);
+  }, [handleSend, navigateToView]);
 
   return (
     <div className={`math-workspace ${showSidebar ? '' : 'sidebar-collapsed'}`}>
@@ -736,8 +1039,7 @@ export default function MathWorkspace() {
           activeView={activeView}
           collapsed={!showSidebar}
           onNavigate={(view) => {
-            setActiveView(view);
-            if (view === 'report') setShowReport(true);
+            navigateToView(view);
           }}
         />
         <ChatSessionsPanel
@@ -757,11 +1059,11 @@ export default function MathWorkspace() {
               setActiveSessionId(id);
               showToast('Storage unavailable. Created a temporary local session.', 6000);
             }
-            setActiveView('chat');
+            navigateToView('chat');
           }}
           onSelectSession={(id) => {
             setActiveSessionId(id);
-            setActiveView('chat');
+            navigateToView('chat');
           }}
           onRenameSession={async (id, title) => {
             if (isEphemeralSessionId(id)) {
@@ -824,19 +1126,59 @@ export default function MathWorkspace() {
             aiMode={aiMode}
             onAIModeChange={setAIMode}
           />
+          <div className="workflow-strip" role="group" aria-label="Workflow presets">
+            <button
+              className="workflow-pill command-launcher"
+              onClick={() => setIsCommandPaletteOpen(true)}
+              title="Open command palette"
+            >
+              ⌘K
+            </button>
+            {WORKFLOW_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                className={`workflow-pill ${activeWorkflowId === preset.id ? 'active' : ''}`}
+                onClick={() => runWorkflowPreset(preset.id)}
+                title={preset.description}
+              >
+                <span>{preset.icon}</span>
+                <span>{preset.label}</span>
+              </button>
+            ))}
+            <span className="workflow-status">{workflowStatus}</span>
+          </div>
           <LevelBadge levelInfo={levelInfo} />
         </div>
 
-        {activeView === 'map' && (
-          <TopicMap selectedTopic={selectedTopic} onSelectTopic={handleTopicSelect} />
+        {coachNudge && (
+          <div className="coach-nudge">
+            <span>{coachNudge}</span>
+            <button
+              className="coach-nudge-btn"
+              onClick={() => runWorkflowPreset('recover')}
+            >
+              Run recovery flow
+            </button>
+            <button className="coach-nudge-dismiss" onClick={() => setCoachNudge('')}>Dismiss</button>
+          </div>
         )}
 
-        {activeView === 'plan' && (
-          <PlanView onSendToChat={(text) => { setActiveView('chat'); handleSend(text); }} />
-        )}
+        <div className={`workspace-view-stage ${viewPhase}`}>
+          {displayView === 'map' && (
+            <React.Suspense fallback={VIEW_LOADER}>
+              <TopicMap selectedTopic={selectedTopic} onSelectTopic={handleTopicSelect} />
+            </React.Suspense>
+          )}
 
-        {activeView === 'quiz' && (
-          <QuizView
+          {displayView === 'plan' && (
+            <React.Suspense fallback={VIEW_LOADER}>
+              <PlanView onSendToChat={(text) => { navigateToView('chat'); handleSend(text); }} />
+            </React.Suspense>
+          )}
+
+          {displayView === 'quiz' && (
+            <React.Suspense fallback={VIEW_LOADER}>
+              <QuizView
             topicId={selectedTopic || 'polynomials'}
             onExtractAnswerFromPhoto={async (imageFile, questionPrompt) => {
               const base64 = await fileToBase64(imageFile);
@@ -854,7 +1196,7 @@ export default function MathWorkspace() {
                 prompt = `I got this solving question wrong:\n\nQuestion: ${question}\n\nExpected answer: ${expected}\n\nDifficulty: ${difficulty}\n\nCan you explain step-by-step how to solve this? What was my mistake?`;
               }
               
-              setActiveView('chat');
+              navigateToView('chat');
               handleSend(prompt);
             }}
             onSubmit={async ({ topicId, quizMode, mcqScore, mcqTotal, solveScore, solveMax, solveDetails }) => {
@@ -903,6 +1245,13 @@ export default function MathWorkspace() {
               }
 
               setGradingResult(nextResult);
+              if (percentage < 70) {
+                setCoachNudge(`Your last score in ${getTopic(topicId)?.label || topicId} was ${percentage}%. Run Mistake Recovery for a targeted rebound.`);
+                setWorkflowStatus('Recovery recommended');
+              } else if (percentage >= 85) {
+                setCoachNudge(`Strong work: ${percentage}% in ${getTopic(topicId)?.label || topicId}. Try Exam Sprint to lock consistency.`);
+                setWorkflowStatus('Progress accelerating');
+              }
               try {
                 await refreshData();
               } catch {
@@ -912,11 +1261,12 @@ export default function MathWorkspace() {
               showToast(`Quiz submitted! Score: ${score}/${maxScore} (${percentage}%)`);
               return nextResult;
             }}
-          />
-        )}
+              />
+            </React.Suspense>
+          )}
 
-        {activeView === 'prereq' && (
-          <div className="panel">
+          {displayView === 'prereq' && (
+            <div className="panel">
             <div className="panel-header">
               <h3>🔗 Prerequisites</h3>
               <p>Select a topic to see what you need to learn first.</p>
@@ -937,7 +1287,7 @@ export default function MathWorkspace() {
                 className="panel-btn primary"
                 onClick={() => {
                   setSelectedTopic(prereqTopicId);
-                  setActiveView('map');
+                  navigateToView('map');
                 }}
               >
                 Show on map
@@ -947,11 +1297,11 @@ export default function MathWorkspace() {
               <strong>Path to {getTopic(prereqTopicId)?.label}:</strong><br />
               {(getPrerequisiteChain(prereqTopicId) || []).map((id) => getTopic(id)?.label || id).join(' → ') || 'No prerequisites'}
             </div>
-          </div>
-        )}
+            </div>
+          )}
 
-        {activeView === 'report' && (
-          <div className="panel">
+          {displayView === 'report' && (
+            <div className="panel">
             <div className="panel-header">
               <h3>📊 My Report</h3>
               <p>View your progress report and mastery breakdown.</p>
@@ -960,13 +1310,14 @@ export default function MathWorkspace() {
               <button className="panel-btn primary" onClick={() => handleQuickAction('report')} disabled={isStreaming}>
                 Open report
               </button>
-              <button className="panel-btn" onClick={() => setActiveView('chat')}>Go to chat</button>
+              <button className="panel-btn" onClick={() => navigateToView('chat')}>Go to chat</button>
             </div>
-          </div>
-        )}
+            </div>
+          )}
 
-        {activeView === 'mistakes' && (
-          <MistakesPanel 
+          {displayView === 'mistakes' && (
+            <React.Suspense fallback={VIEW_LOADER}>
+              <MistakesPanel 
             topicId={selectedTopic || null}
             onAskAI={(mistake) => {
               const { problem, description, type, difficulty, topic } = mistake;
@@ -982,14 +1333,15 @@ export default function MathWorkspace() {
                 prompt = `Explain this mistake with only factual math guidance.\n\nQuestion: ${safeProblem}\nMistake: ${safeDescription}\n\nRules:\n- No speculative student psychology.\n- No internal reasoning text.\n- Provide direct correction steps only.`;
               }
               
-              setActiveView('chat');
+              navigateToView('chat');
               handleSend(prompt);
             }}
-          />
-        )}
+              />
+            </React.Suspense>
+          )}
 
-        {activeView === 'chat' && (
-          <ChatAssistant
+          {displayView === 'chat' && (
+            <ChatAssistant
             messages={messages}
             onSend={handleSend}
             onSendWithImage={handleSendWithImage}
@@ -999,13 +1351,16 @@ export default function MathWorkspace() {
             onAbort={abort}
             studentName={settings.studentName || 'Student'}
             routeBadge={routeBadge}
-          />
-        )}
+            />
+          )}
+        </div>
 
         {/* Graph Panel */}
         {chartData && (
           <div className="graph-panel">
-            <GraphPlotter chartData={chartData} equation={chartEquation} />
+            <React.Suspense fallback={VIEW_LOADER}>
+              <GraphPlotter chartData={chartData} equation={chartEquation} />
+            </React.Suspense>
             <button className="graph-close" onClick={() => setChartData(null)}>✕</button>
           </div>
         )}
@@ -1013,8 +1368,10 @@ export default function MathWorkspace() {
 
       {/* Right Sidebar — Always visible utility rail */}
       <aside className="workspace-sidebar-right">
-        {(activeView === 'quiz' || gradingResult) ? (
-          <MarksDashboard gradingResult={gradingResult} examHistory={examHistory} />
+        {(displayView === 'quiz' || gradingResult) ? (
+          <React.Suspense fallback={VIEW_LOADER}>
+            <MarksDashboard gradingResult={gradingResult} examHistory={examHistory} />
+          </React.Suspense>
         ) : (
           <div className="side-rail">
             <div className="side-rail-card">
@@ -1061,9 +1418,66 @@ export default function MathWorkspace() {
 
             <div className="side-rail-card">
               <h4>Quick Suggestions</h4>
-              <button className="side-rail-btn" onClick={() => handleSend('Give me 3 practice problems for my current level.')}>Practice now</button>
-              <button className="side-rail-btn" onClick={() => handleSend('Explain the last concept in a simpler way.')}>Simpler explanation</button>
-              <button className="side-rail-btn" onClick={() => setActiveView('map')}>Open topic map</button>
+              {dynamicSuggestions.map((suggestion) => (
+                <button
+                  key={suggestion}
+                  className="side-rail-btn"
+                  onClick={() => handleSend(suggestion)}
+                >
+                  {suggestion}
+                </button>
+              ))}
+              <button className="side-rail-btn" onClick={() => navigateToView('map')}>Open topic map</button>
+            </div>
+
+            <div className="side-rail-card">
+              <h4>Focus Sprint</h4>
+              <div className="focus-timer">{focusTimeLabel}</div>
+              <div className="focus-presets">
+                {[5, 15, 25].map((m) => (
+                  <button
+                    key={m}
+                    className={`focus-preset-btn ${focusMinutes === m ? 'active' : ''}`}
+                    onClick={() => {
+                      setFocusMinutes(m);
+                      setFocusRemaining(m * 60);
+                      setFocusRunning(false);
+                    }}
+                  >
+                    {m}m
+                  </button>
+                ))}
+              </div>
+              <div className="focus-actions">
+                <button className="side-rail-btn" onClick={() => setFocusRunning((value) => !value)}>
+                  {focusRunning ? 'Pause sprint' : 'Start sprint'}
+                </button>
+                <button
+                  className="side-rail-btn"
+                  onClick={() => {
+                    setFocusRunning(false);
+                    setFocusRemaining(focusMinutes * 60);
+                  }}
+                >
+                  Reset
+                </button>
+              </div>
+            </div>
+
+            <div className="side-rail-card">
+              <h4>Learning Momentum</h4>
+              <div className="momentum-row">
+                <span>Momentum score</span>
+                <b>{momentumScore}/100</b>
+              </div>
+              <div className="momentum-bar">
+                <div className="momentum-fill" style={{ width: `${momentumScore}%` }} />
+              </div>
+              <p className="side-rail-empty">
+                {momentumScore >= 75
+                  ? 'You are in a strong learning rhythm. Push one hard challenge.'
+                  : 'Build momentum with a warmup and one quiz cycle.'}
+              </p>
             </div>
 
             <div className="side-rail-card">
@@ -1090,9 +1504,23 @@ export default function MathWorkspace() {
         )}
       </aside>
 
+      <WorkflowCommandPalette
+        isOpen={isCommandPaletteOpen}
+        query={commandQuery}
+        onQueryChange={setCommandQuery}
+        commands={commandItems}
+        onRun={handleCommandRun}
+        onClose={() => {
+          setIsCommandPaletteOpen(false);
+          setCommandQuery('');
+        }}
+      />
+
       {/* Report Overlay */}
       {showReport && (
-        <StudentReport report={report} onClose={() => setShowReport(false)} />
+        <React.Suspense fallback={VIEW_LOADER}>
+          <StudentReport report={report} onClose={() => setShowReport(false)} />
+        </React.Suspense>
       )}
     </div>
   );

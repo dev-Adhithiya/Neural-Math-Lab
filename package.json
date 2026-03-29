@@ -5,9 +5,10 @@
   "description": "Multimodal AI Math Tutor — Socratic teaching, OCR, dynamic grading, prerequisite engine",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently \"npm:dev:api\" \"npm:dev:ui\"",
+    "dev:ui": "vite",
     "dev:api": "node server/proxy.js",
-    "dev:full": "concurrently \"npm:dev:api\" \"npm:dev\"",
+    "dev:full": "concurrently \"npm:dev:api\" \"npm:dev:ui\"",
     "build": "vite build",
     "preview": "vite preview"
   },

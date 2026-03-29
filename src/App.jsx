@@ -1,9 +1,10 @@
 import React from 'react';
-import MathWorkspace from './components/MathWorkspace.jsx';
-import SettingsModal from './components/SettingsModal.jsx';
 import { SettingsProvider } from './context/SettingsContext.jsx';
 import { useSettings } from './context/SettingsContext.jsx';
 import './styles/index.css';
+
+const MathWorkspace = React.lazy(() => import('./components/MathWorkspace.jsx'));
+const SettingsModal = React.lazy(() => import('./components/SettingsModal.jsx'));
 
 /**
  * App — Root component for Neural Math Lab.
@@ -51,8 +52,12 @@ function AppShell({ showSettings, setShowSettings }) {
         </div>
       </header>
 
-      <MathWorkspace />
-      <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
+      <React.Suspense fallback={<div className="app-loading">Loading workspace...</div>}>
+        <MathWorkspace />
+      </React.Suspense>
+      <React.Suspense fallback={null}>
+        <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
+      </React.Suspense>
     </div>
   );
 }

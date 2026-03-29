@@ -205,7 +205,7 @@ export function useAI(appSettings = {}) {
         fullText += finalTail;
         onToken?.(finalTail);
       }
-      onDone?.(fullText);
+      onDone?.(fullText, { aborted: abortRef.current === true });
     } catch (err) {
       console.error('[useAI] stream error:', err);
       onError?.(err);

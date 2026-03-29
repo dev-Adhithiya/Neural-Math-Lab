@@ -28,20 +28,17 @@ RULES:
 
 Example good response: "I'd love to help! What math topic are you interested in? Algebra, Geometry, Calculus? Or if you're continuing from before, what were we working on last time?"`,
 
-  TEACHING: `You are a Socratic math tutor. Your goal is to TEACH and EXPLAIN concepts step by step.
+  TEACHING: `You are Neural Math Lab's Math Solver — precise, efficient, and thorough.
 
-IMPORTANT: Do NOT reveal internal chain-of-thought, hidden reasoning, or planning. Provide only the student-facing explanation.
+IMPORTANT: Do NOT reveal internal chain-of-thought, hidden reasoning, or planning. Show only concise, student-facing solution steps and the final answer.       
 
-RULES (follow exactly, output nothing else):
-- FIRST: Explain the concept, key formula, or approach (2-3 sentences of teaching).
-- THEN: Ask exactly ONE guiding question to help the student apply what you just taught.
-- Do NOT ask questions before teaching.
-- Do NOT write scenario planning, role-play, or show alternative options.
-- Use $...$ for inline math and $$...$$ for block equations.
-
-When you receive image content:
-- If you can read it: explain the concept shown, then ask a guiding question.
-- If unclear: politely ask the student to describe or retake the photo.`,
+RULES:
+1. Provide the COMPLETE solution with all steps shown clearly.
+2. Use LaTeX notation for ALL math: wrap inline math in $...$ and display math in $$...$$.
+3. At the end of the solution, DO NOT generate practice problems immediately. Instead, add a line asking: "Would you like to try a similar practice problem?" (or something similar based on the scenario).
+4. ONLY if the user explicitly asks you to plot or show a graph, include: [GRAPH: f(x) = expression] for automatic visualization. IMPORTANT: inside the GRAPH tag, use plain text math (e.g. x^2 or sin(x)), NEVER use LaTeX (like x^{2} or \\sin).
+5. Highlight key formulas and theorems used.
+6. Keep explanations clear but comprehensive.`,
 
 
   SOLVER: `You are Neural Math Lab's Math Solver — precise, efficient, and thorough.
@@ -51,16 +48,14 @@ IMPORTANT: Do NOT reveal internal chain-of-thought, hidden reasoning, or plannin
 RULES:
 1. Provide the COMPLETE solution with all steps shown clearly.
 2. Use LaTeX notation for ALL math: wrap inline math in $...$ and display math in $$...$$.
-3. After the solution, provide 2 similar practice problems for the student.
-4. When showing functions or geometric concepts, include: [GRAPH: f(x) = expression] for automatic visualization.
-5. Highlight key formulas and theorems used.
+3. At the end of the solution, DO NOT generate practice problems immediately. Instead, add a line asking: "Would you like to try a similar practice problem?" (or something similar based on the scenario).
+4. ONLY if the user explicitly asks you to plot or show a graph, include: [GRAPH: f(x) = expression] for automatic visualization. IMPORTANT: inside the GRAPH tag, use plain text math (e.g. x^2 or sin(x)), NEVER use LaTeX (like x^{2} or \\sin).5. Highlight key formulas and theorems used.
 6. Keep explanations clear but comprehensive.`,
 
 };
 
 function sanitizeTutorOutput(raw) {
   let text = String(raw || '').trim();
-
   // Remove hidden reasoning traces that some local models emit.
   text = text
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -69,9 +64,9 @@ function sanitizeTutorOutput(raw) {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
-  // ── 2. Collapse blank lines, cap at 4 paragraphs for readability ──
+  // ── 2. Collapse blank lines ──
   const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  text = paras.slice(0, 4).join('\n\n').trim();
+  text = paras.join('\n\n').trim();
 
   if (!text) return 'Could you describe the problem in your own words so I can help you?';
 
@@ -318,19 +313,19 @@ Overall feedback areas: ${gr.feedback || 'None'}
           callbacks.onGraphDetected?.(graphMatch[1].trim());
         }
       },
-      onDone: (text) => {
+      onDone: (text, meta = {}) => {
         const clean = sanitizeTutorOutput(text);
         this.conversationHistory.push({ role: 'assistant', content: clean });
-        // Keep history manageable — last 20 turns
+        // Keep history manageable — last 40 turns
         if (this.conversationHistory.length > 40) {
           this.conversationHistory = this.conversationHistory.slice(-40);
         }
         this._lastGraphMatch = null;
-        callbacks.onDone?.(clean);
+        callbacks.onDone?.(clean, meta);
       },
       onError: callbacks.onError,
       temperature: this.mode === 'TEACHING' ? 0.8 : 0.4,
-      maxTokens: 2048,
+      maxTokens: 16384,
     });
 
     return response;

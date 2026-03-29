@@ -27,30 +27,43 @@ function extractText(value) {
   return '';
 }
 
+const SAFETY_RE = {
+  violence: /(kill|bomb|weapon|attack|harm\s+someone)/i,
+  self_harm: /(suicide|self-harm|kill myself|cut myself)/i,
+  hate: /(racial slur|hate\s+\w+\s+people|nazi)/i,
+  sexual: /(explicit sex|sexual content with minor|child porn)/i,
+  cyber_abuse: /(credit card cvv|steal password|phishing|bypass auth)/i,
+};
+
 function detectSafetyCategories(text) {
-  const t = String(text || '').toLowerCase();
+  if (!text) return [];
   const out = [];
-  if (/(kill|bomb|weapon|attack|harm\s+someone)/i.test(t)) out.push('violence');
-  if (/(suicide|self-harm|kill myself|cut myself)/i.test(t)) out.push('self_harm');
-  if (/(racial slur|hate\s+\w+\s+people|nazi)/i.test(t)) out.push('hate');
-  if (/(explicit sex|sexual content with minor|child porn)/i.test(t)) out.push('sexual');
-  if (/(credit card cvv|steal password|phishing|bypass auth)/i.test(t)) out.push('cyber_abuse');
+  if (SAFETY_RE.violence.test(text)) out.push('violence');
+  if (SAFETY_RE.self_harm.test(text)) out.push('self_harm');
+  if (SAFETY_RE.hate.test(text)) out.push('hate');
+  if (SAFETY_RE.sexual.test(text)) out.push('sexual');
+  if (SAFETY_RE.cyber_abuse.test(text)) out.push('cyber_abuse');
   return out;
 }
 
+const PROMPT_INJECTION_MARKERS = [
+  'ignore previous instructions',
+  'reveal system prompt',
+  'developer message',
+  'jailbreak',
+  'pretend to be',
+  'bypass safety',
+  'show chain of thought',
+  'exfiltrate',
+];
+
 function detectPromptInjection(text) {
-  const t = String(text || '').toLowerCase();
-  const markers = [
-    'ignore previous instructions',
-    'reveal system prompt',
-    'developer message',
-    'jailbreak',
-    'pretend to be',
-    'bypass safety',
-    'show chain of thought',
-    'exfiltrate',
-  ];
-  return markers.some((m) => t.includes(m));
+  if (!text) return false;
+  const lower = String(text).toLowerCase();
+  for (let i = 0; i < PROMPT_INJECTION_MARKERS.length; i++) {
+    if (lower.indexOf(PROMPT_INJECTION_MARKERS[i]) !== -1) return true;
+  }
+  return false;
 }
 
 function evaluatePolicy(text, strictMode) {
@@ -181,8 +194,14 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
         prompt_eval_count: 0,
         prompt_eval_duration: 0,
         eval_duration: 0,
+        done: true
       };
       res.set('X-Cache', 'HIT');
+      if (req.body?.stream !== false) {
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.write(JSON.stringify(cacheData) + '\n');
+        return res.end();
+      }
       return res.json(cacheData);
     }
 
@@ -192,11 +211,24 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
     
     // ========== OPTIMIZATION 3: Get optimized system prompt ==========
     const systemPrompt = getOptimizedSystemPrompt(profile);
-    const formattedPrompt = `${systemPrompt}\n\nUser: ${formatOptimizedPrompt(userPrompt, profile)}`;
+    const optimizedUser = formatOptimizedPrompt(userPrompt, profile);
+    const modelStr = req.body?.model || process.env.OLLAMA_MODEL || 'deepseek-r1:7b';
+    
+    let formattedPrompt = `${systemPrompt}\n\nUser: ${optimizedUser}`;
+    let isRaw = false;
+
+    // We no longer bypass CoT for deepseek-r1 because it needs space to think,
+    // and bypassing it causes hallucinations/cutoffs.
+    if (modelStr.includes('deepseek-r1') && profile === 'ultra-fast-disabled') {
+      isRaw = true;
+      formattedPrompt = `<｜begin of sentence｜>${systemPrompt}<｜User｜>${optimizedUser}<｜Assistant｜><think>\n</think>\n`;
+    }
 
     const body = {
-      model: req.body?.model || process.env.OLLAMA_MODEL || 'deepseek-r1:7b',
+      model: modelStr,
+      system: isRaw ? undefined : systemPrompt,
       prompt: formattedPrompt,
+      raw: isRaw,
       stream: req.body?.stream !== false,
       keep_alive: req.body?.keep_alive || '10m',
       options: {
@@ -207,7 +239,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
 
     // ========== OPTIMIZATION 4: Add request timeout ==========
     const controller = new AbortController();
-    const timeoutMs = req.body?.timeout || 25000;  // 25s timeout (instead of waiting forever)
+    const timeoutMs = req.body?.timeout || 300000;  // 5m timeout to allow deepseek-r1 to finish long thoughts
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     const r = await fetch(ollamaUrl, {
@@ -247,6 +279,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
     const decoder = new TextDecoder();
     let buffer = '';
     let accumulated = '';
+    let lastPolicyCheckLength = 0;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -269,16 +302,21 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
 
         if (parsed?.response) {
           accumulated += parsed.response;
-          const outPolicy = evaluatePolicy(accumulated, Boolean(req.body?.strictMode ?? STRICT_MODE_DEFAULT));
-          if (outPolicy.blocked) {
-            const blockedChunk = {
-              model: body.model,
-              response: '\n\n[Blocked by safety policy]\n',
-              done: true,
-            };
-            res.write(`${JSON.stringify(blockedChunk)}\n`);
-            responseCache.set(userPrompt, '[Blocked by safety policy]');  // Cache blocked response too
-            return res.end();
+          
+          // Only check policy every 100 characters to prevent O(N^2) CPU burn on streams
+          if (accumulated.length - lastPolicyCheckLength > 100 || parsed.done) {
+            lastPolicyCheckLength = accumulated.length;
+            const outPolicy = evaluatePolicy(accumulated, Boolean(req.body?.strictMode ?? STRICT_MODE_DEFAULT));
+            if (outPolicy.blocked) {
+              const blockedChunk = {
+                model: body.model,
+                response: '\n\n[Blocked by safety policy]\n',
+                done: true,
+              };
+              res.write(`${JSON.stringify(blockedChunk)}\n`);
+              responseCache.set(userPrompt, '[Blocked by safety policy]');  // Cache blocked response too
+              return res.end();
+            }
           }
         }
 

@@ -12,90 +12,70 @@
 export const INFERENCE_PROFILES = {
   // Fast: Simple questions, 2-3s target
   fast: {
-    temperature: 0.3,          // Lower = more deterministic (faster)
-    top_p: 0.85,              // Reduce diversity
-    top_k: 20,                // Limit vocabulary pool
-    min_p: 0.01,              // Kill low-probability tokens early
-    repeat_penalty: 1.2,      // Avoid repetition (saves tokens)
-    max_tokens: 200,          // Short responses for simple questions
-    num_predict: 200,
+    temperature: 0.6,
+    top_p: 0.95,
+    top_k: 40,
+    min_p: 0.05,
+    repeat_penalty: 1.1,
+    max_tokens: 8192,
+    num_predict: 8192,
+    num_ctx: 8192,
   },
 
   // balanced: Medium complexity, 8-10s target
   balanced: {
-    temperature: 0.4,
-    top_p: 0.9,
+    temperature: 0.6,
+    top_p: 0.95,
     top_k: 40,
-    min_p: 0.0,
+    min_p: 0.05,
     repeat_penalty: 1.1,
-    max_tokens: 500,
-    num_predict: 500,
+    max_tokens: 8192,
+    num_predict: 8192,
+    num_ctx: 8192,
   },
 
   // thorough: Complex reasoning (p95), 12-15s target
   thorough: {
-    temperature: 0.5,
-    top_p: 0.92,
+    temperature: 0.6,
+    top_p: 0.95,
     top_k: 60,
-    min_p: 0.0,
-    repeat_penalty: 1.05,
-    max_tokens: 1200,
-    num_predict: 1200,
+    min_p: 0.05,
+    repeat_penalty: 1.1,
+    max_tokens: 8192,
+    num_predict: 8192,
+    num_ctx: 8192,
   },
 };
 
 /**
  * Auto-select inference profile based on question complexity heuristic
  */
-export function selectInferenceProfile(prompt: string): string {
-  const wordCount = prompt.split(/\s+/).length;
-  const hasMultiSteps = /step|process|show|derive|prove|explain|why|how/i.test(prompt);
-  const isComplex = /integral|derivative|matrix|system.*equation|limit|series|convergence/i.test(prompt);
-
-  if (isComplex && wordCount > 50) return 'thorough';
-  if (hasMultiSteps || wordCount > 30) return 'balanced';
-  return 'fast';
+export function selectInferenceProfile(prompt) {
+  // Always prefer thorough as requested: "forget latency, just give full answer"
+  return 'thorough';
 }
 
 /**
  * Construct optimized system prompt for speed
  */
-export function getOptimizedSystemPrompt(profile: string): string {
-  const basePrompt = `You are a math tutor. Answer concisely and clearly.
+export function getOptimizedSystemPrompt(profile) {
+  const basePrompt = `You are a math tutor. Answer comprehensively and clearly.
 Focus on the core insight needed to solve the problem.
 Use standard mathematical notation.
-For multi-step problems, number each step.
-Be direct - avoid lengthy preambles.`;
+For multi-step problems, number each step.`;
 
-  if (profile === 'fast') {
-    return `${basePrompt}
-Keep responses under 150 words.
-Provide only essential steps.`;
-  }
-
-  if (profile === 'thorough') {
-    return `${basePrompt}
+  return `${basePrompt}
 Show all key working steps.
 Explain the reasoning at each stage.
 Include intermediate results.`;
-  }
-
-  return basePrompt;
 }
 
 /**
  * Format student question for optimal model inference
  */
-export function formatOptimizedPrompt(question: string, profile: string): string {
+export function formatOptimizedPrompt(question, profile) {
   // Remove whitespace, normalize formatting
-  const clean = question.trim().replace(/\s+/g, ' ');
-  
-  // For simple questions, add direct instruction
-  if (profile === 'fast') {
-    return `${clean}\n\nAnswer briefly.`;
-  }
-  
-  return clean;
+  return question.trim().replace(/\s+/g, ' ');
 }
 
 /**

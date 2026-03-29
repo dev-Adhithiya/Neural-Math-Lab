@@ -274,11 +274,11 @@ export class OfflineProvider {
     });
 
     const generated = output[0].generated_text.slice(prompt.length);
-    // Simulate streaming by yielding word-by-word
+    // Simulate streaming by yielding word-by-word without artificial blocking if possible
     const words = generated.split(/(\s+)/);
     for (const word of words) {
-      yield word;
-      await new Promise((r) => setTimeout(r, 18));
+      if (word.trim()) yield word;
+      else if (word) yield word; // spaces
     }
   }
 

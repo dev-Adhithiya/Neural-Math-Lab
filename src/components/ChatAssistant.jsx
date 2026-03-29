@@ -118,6 +118,15 @@ export default function ChatAssistant({
     { id: 'report', icon: '📊', label: 'My Report', desc: 'View your progress report' },
   ];
 
+  const escapeHtml = (text) => {
+    return String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  };
+
   return (
     <div className="chat-assistant">
       {/* Chat Header */}
@@ -193,8 +202,8 @@ export default function ChatAssistant({
             <div className="message-avatar">🧠</div>
             <div className="message-content">
               <div
-                className="message-text"
-                dangerouslySetInnerHTML={{ __html: renderMathInText(streamingText) }}
+                className="message-text message-text-streaming"
+                dangerouslySetInnerHTML={{ __html: escapeHtml(streamingText) }}
               />
               <span className="typing-cursor">▊</span>
             </div>
