@@ -2,7 +2,8 @@
 
 A comprehensive, secure, and highly optimized math tutoring application built with React + Vite. Features hybrid AI integration (Azure OpenAI + Ollama), multimodal agents for image-based math problem solving, persistent chat sessions, robust security guardrails, and industry-grade latency optimizations.
 
-<img width="1408" height="768" alt="Gemini_Generated_Image_h5va7bh5va7bh5va" src="https://github.com/user-attachments/assets/b8d765ba-a358-4bca-9d2c-c76cab5ccb97" />
+
+<img width="1408" height="633" alt="image 1" src="https://github.com/user-attachments/assets/79c3224b-78e7-46e1-86e0-54742adfb2f5" />
 
 ---
 
