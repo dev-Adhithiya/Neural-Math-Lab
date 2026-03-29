@@ -2,6 +2,8 @@
 
 A comprehensive, secure, and highly optimized math tutoring application built with React + Vite. Features hybrid AI integration (Azure OpenAI + Ollama), multimodal agents for image-based math problem solving, persistent chat sessions, robust security guardrails, and industry-grade latency optimizations.
 
+<img width="1408" height="768" alt="Gemini_Generated_Image_h5va7bh5va7bh5va" src="https://github.com/user-attachments/assets/b8d765ba-a358-4bca-9d2c-c76cab5ccb97" />
+
 ---
 
 ## 🚀 Key Features
@@ -24,7 +26,9 @@ Our system leverages a collaborative agentic architecture:
 #### Agent Workflow Diagram
 *(Upload your architectural diagram or agent workflow image to your repository and replace the link below)*
 
-![Agent Workflow Diagram](./docs/agent-workflow.png)
+
+<img width="1408" height="768" alt="Gemini_Generated_Image_d2uwhvd2uwhvd2uw" src="https://github.com/user-attachments/assets/a135fb62-fd3b-4554-be8a-327eb18290ab" />
+
 
 ### 💻 Interactive UI & Rich Components
 - **Math Workspace**: Dynamic chat interface supporting LaTeX rendering and syntax highlighting.
