@@ -13,10 +13,11 @@ import { getAnnotatedTopics, buildProgressMap } from '../agents/KnowledgeGraph.j
 import { generateSessionPlan, planToMessage } from '../agents/ProactivePlanner.js';
 import { generateReport } from '../agents/StudentReportGenerator.js';
 import { calculateLevel, awardParticipation, awardStepByStep, getCurrentLevel } from '../engine/GamificationEngine.js';
-import { plotMathFunction, extractGraphCommands } from '../engine/DynamicGraphing.js';
+import { plotMathFunction, extractBestGraphEquation } from '../engine/DynamicGraphing.js';
 import { processHandwriting } from '../vision/VisionModule.js';
-import { extractMathWithMoondream, preprocessForOcr } from '../vision/ImageDispatcher.js';
+import { extractMathWithRetries, isLowConfidenceOcrText, VISION_REQUEST_PROMPT, OCR_STRICT_TRANSCRIBE_PROMPT } from '../vision/ImageDispatcher.js';
 import { TOPICS, getTopic, getPrerequisiteChain } from '../agents/KnowledgeGraph.js';
+import { getDefaultOllamaProxyUrl } from '../config/api.js';
 import {
   getProfile, getPrerequisiteProgress, getExamHistory,
   saveChatMessage, getMistakes, saveExamResult,
@@ -76,16 +77,55 @@ function buildSessionTitleFromPrompt(prompt) {
   return `${withoutOuterQuotes.slice(0, 49).trimEnd()}...`;
 }
 
-function fileToBase64(file) {
+function fileToImagePayload(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
       const result = String(reader.result || '');
-      resolve(result.split(',')[1] || '');
+      resolve({
+        dataUrl: result,
+        base64: result.split(',')[1] || '',
+        mimeType: String(file?.type || '').trim() || 'image/jpeg',
+      });
     };
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+function parseJsonObjectFromText(rawText) {
+  const raw = String(rawText || '').trim();
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch {
+    // Continue with best-effort extraction.
+  }
+
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    try {
+      const parsed = JSON.parse(fenced[1].trim());
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      // Continue with broad brace extraction.
+    }
+  }
+
+  const firstBrace = raw.indexOf('{');
+  const lastBrace = raw.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      const parsed = JSON.parse(raw.slice(firstBrace, lastBrace + 1));
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
 }
 
 function balanceLatexAndMarkdown(text) {
@@ -113,6 +153,27 @@ function balanceLatexAndMarkdown(text) {
 
 function finalizeAssistantText(rawText) {
   return balanceLatexAndMarkdown(String(rawText || '').replace(/\n{3,}/g, '\n\n'));
+}
+
+function hasRenderableGraphPoints(chartData) {
+  const points = chartData?.datasets?.[0]?.data;
+  if (!Array.isArray(points)) return false;
+  return points.some((point) => point && typeof point.y === 'number' && Number.isFinite(point.y));
+}
+
+function buildGraphFromAssistantText(text) {
+  const inferredEquation = extractBestGraphEquation(text);
+  if (!inferredEquation) return null;
+
+  const graphData = plotMathFunction(inferredEquation);
+  if (!graphData.parsed || !hasRenderableGraphPoints(graphData)) {
+    return null;
+  }
+
+  return {
+    equation: inferredEquation,
+    data: graphData,
+  };
 }
 
 const WORKFLOW_PRESETS = [
@@ -165,6 +226,7 @@ const VIEW_LABELS = {
 };
 
 const VIEW_LOADER = <div className="view-loader">Loading view...</div>;
+const DEMO_AGGRESSIVE_LONG_ANSWER = false;
 
 /**
  * MathWorkspace — Main application workspace.
@@ -204,10 +266,18 @@ export default function MathWorkspace() {
   const [focusMinutes, setFocusMinutes] = useState(15);
   const [focusRemaining, setFocusRemaining] = useState(15 * 60);
   const [focusRunning, setFocusRunning] = useState(false);
+  const [customFocusMinutes, setCustomFocusMinutes] = useState('15');
   const [coachNudge, setCoachNudge] = useState('');
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState('');
   const streamingBufferRef = useRef('');
+  const graphStreamDetectedRef = useRef(false);
+  const graphPanelRef = useRef(null);
+
+  useEffect(() => {
+    if (!chartData || !graphPanelRef.current) return;
+    graphPanelRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [chartData]);
 
   const showToast = useCallback((message, duration = 4600) => {
     setToast(message);
@@ -618,6 +688,7 @@ export default function MathWorkspace() {
     }
 
     try {
+      graphStreamDetectedRef.current = false;
       await tutorRef.current.chat(trimmed, {
         studentName: settings.studentName || 'Student',
         topicId: selectedTopic,
@@ -628,6 +699,17 @@ export default function MathWorkspace() {
         onToken: (token) => {
           streamingBufferRef.current += token;
           setStreamingText((prev) => prev + token);
+
+          if (!graphStreamDetectedRef.current
+            && streamingBufferRef.current.includes('[GRAPH:')
+            && streamingBufferRef.current.includes(']')) {
+            const graphResult = buildGraphFromAssistantText(streamingBufferRef.current);
+            if (graphResult) {
+              setChartData(graphResult.data);
+              setChartEquation(graphResult.equation);
+              graphStreamDetectedRef.current = true;
+            }
+          }
         },
         onDone: async (fullText, meta = {}) => {
           const finalText = finalizeAssistantText(fullText);
@@ -648,12 +730,10 @@ export default function MathWorkspace() {
             }
           }
 
-          // Check for graphs
-          const graphEqs = extractGraphCommands(finalText);
-          if (graphEqs.length > 0) {
-            const data = plotMathFunction(graphEqs[0]);
-            setChartData(data);
-            setChartEquation(graphEqs[0]);
+          const graphResult = buildGraphFromAssistantText(finalText);
+          if (graphResult) {
+            setChartData(graphResult.data);
+            setChartEquation(graphResult.equation);
           }
 
           // Award participation XP (best-effort only in temporary mode)
@@ -716,8 +796,11 @@ export default function MathWorkspace() {
         },
         onGraphDetected: (equation) => {
           const data = plotMathFunction(equation);
-          setChartData(data);
-          setChartEquation(equation);
+          if (data.parsed && hasRenderableGraphPoints(data)) {
+            setChartData(data);
+            setChartEquation(equation);
+            graphStreamDetectedRef.current = true;
+          }
         },
       });
     } catch (err) {
@@ -788,13 +871,27 @@ export default function MathWorkspace() {
     }
 
     if (preset.id === 'exam') {
-      setFocusMinutes(15);
-      setFocusRemaining(15 * 60);
+      const sprintMinutes = Math.max(1, Number(focusMinutes) || 15);
+      setFocusMinutes(sprintMinutes);
+      setFocusRemaining(sprintMinutes * 60);
       setFocusRunning(true);
     }
 
     handleSend(preset.prompt);
-  }, [handleSend, navigateToView]);
+  }, [handleSend, navigateToView, focusMinutes]);
+
+  const applyCustomSprintTimer = useCallback((autoStart = false) => {
+    const parsed = Number.parseInt(String(customFocusMinutes || '').trim(), 10);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 180) {
+      showToast('Enter a custom sprint between 1 and 180 minutes.', 3200);
+      return;
+    }
+
+    setFocusMinutes(parsed);
+    setFocusRemaining(parsed * 60);
+    setFocusRunning(Boolean(autoStart));
+    setWorkflowStatus(`Custom sprint ${parsed}m ${autoStart ? 'started' : 'ready'}`);
+  }, [customFocusMinutes, showToast]);
 
   const focusTimeLabel = React.useMemo(() => {
     const mm = String(Math.floor(focusRemaining / 60)).padStart(2, '0');
@@ -852,16 +949,16 @@ export default function MathWorkspace() {
       const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
       const allowOnlineVision = isOnline && settings.aiMode !== 'offline';
 
-      let extractedText = "";
+      let extractedText = '';
+      let ocrAttemptTrace = [];
 
       // STEP 2: OCR — try to extract text from the image.
       if (!allowOnlineVision) {
-          // Offline: moondream is a small vision model and often fails to read
-          // printed/handwritten math. We try our best, but never block on failure.
+          // Offline OCR uses multiple attempts to preserve clean screenshot text and still help blurry handwriting.
           try {
-            const pre = await preprocessForOcr(file);
-            const result = await extractMathWithMoondream(pre, { ollamaUrl: settings.ollamaUrl });
-            extractedText = result?.text || '';
+            const result = await extractMathWithRetries(file, { ollamaUrl: settings.ollamaUrl });
+            extractedText = String(result?.text || '').trim();
+            ocrAttemptTrace = Array.isArray(result?.attempts) ? result.attempts : [];
           } catch (ocrErr) {
             console.warn('[MathWorkspace] Offline OCR failed, forwarding anyway:', ocrErr.message);
           }
@@ -870,10 +967,17 @@ export default function MathWorkspace() {
           extractedText = result?.latex || result?.text || '';
       }
 
+      if (!allowOnlineVision && ocrAttemptTrace.length > 0) {
+        const hasHighConfidenceAttempt = ocrAttemptTrace.some((attempt) => attempt?.text && !attempt?.lowConfidence);
+        if (!hasHighConfidenceAttempt) {
+          console.info('[MathWorkspace] Offline OCR remained low-confidence after retries.', ocrAttemptTrace);
+        }
+      }
+
       // STEP 3: Gatekeeper — online mode only.
       // In offline mode moondream regularly misses printed/handwritten math even on clear images.
       // Never block the student offline — pass it to the agent regardless and let it ask for help.
-      const ocrFailed = !extractedText || extractedText.includes("ERROR_NO_CONTENT") || extractedText.trim() === "";
+      const ocrFailed = !extractedText || extractedText.includes('ERROR_NO_CONTENT');
 
       if (ocrFailed && allowOnlineVision) {
          // Online OCR genuinely found nothing — likely not a math image.
@@ -917,6 +1021,7 @@ export default function MathWorkspace() {
         mistakes = [];
       }
       
+      graphStreamDetectedRef.current = false;
       await tutorRef.current.chat(fullPrompt, {
         studentName: settings.studentName || 'Student',
         topicId: selectedTopic,
@@ -927,6 +1032,17 @@ export default function MathWorkspace() {
         onToken: (token) => {
           streamingBufferRef.current += token;
           setStreamingText((prev) => prev + token);
+
+          if (!graphStreamDetectedRef.current
+            && streamingBufferRef.current.includes('[GRAPH:')
+            && streamingBufferRef.current.includes(']')) {
+            const graphResult = buildGraphFromAssistantText(streamingBufferRef.current);
+            if (graphResult) {
+              setChartData(graphResult.data);
+              setChartEquation(graphResult.equation);
+              graphStreamDetectedRef.current = true;
+            }
+          }
         },
         onDone: async (fullText, meta = {}) => {
           const finalText = finalizeAssistantText(fullText);
@@ -938,11 +1054,10 @@ export default function MathWorkspace() {
 
           const assistantMsg = { role: 'assistant', content: finalText, id: Date.now() + 1 };
           
-          const graphEqs = extractGraphCommands(finalText);
-          if (graphEqs.length > 0) {
-            const data = plotMathFunction(graphEqs[0]);
-            setChartData(data);
-            setChartEquation(graphEqs[0]);
+          const graphResult = buildGraphFromAssistantText(finalText);
+          if (graphResult) {
+            setChartData(graphResult.data);
+            setChartEquation(graphResult.equation);
           }
 
           try {
@@ -1181,23 +1296,890 @@ export default function MathWorkspace() {
               <QuizView
             topicId={selectedTopic || 'polynomials'}
             onExtractAnswerFromPhoto={async (imageFile, questionPrompt) => {
-              const base64 = await fileToBase64(imageFile);
+              const imagePayload = await fileToImagePayload(imageFile);
               const extractionPrompt = `You are reading a student's handwritten solution for this math question:\n${questionPrompt}\n\nReturn ONLY the student's final answer text.\n- No explanation\n- No markdown\n- If answer has multiple roots, return in one line\n- If unreadable, return UNCLEAR`;
-              const extracted = await analyzeImage(base64, extractionPrompt);
+              const extracted = await analyzeImage(imagePayload.dataUrl || imagePayload.base64, extractionPrompt);
               return String(extracted || '').trim();
             }}
             onAskAI={(data) => {
-              const { type, question, expected, topic, difficulty } = data;
+              const {
+                type,
+                question,
+                expected,
+                topic,
+                difficulty,
+                detectedAnswer,
+                studentWork,
+                whatWentWrong,
+                whereLostMarks,
+                marksLost,
+                stepBreakdown,
+              } = data;
               let prompt = '';
               
               if (type === 'quiz_doubt') {
                 prompt = `I just completed a quiz on ${topic}. I have some doubts and questions about the topics covered. Can you help me understand the concepts better?`;
               } else if (type === 'solve') {
-                prompt = `I got this solving question wrong:\n\nQuestion: ${question}\n\nExpected answer: ${expected}\n\nDifficulty: ${difficulty}\n\nCan you explain step-by-step how to solve this? What was my mistake?`;
+                const stepBreakdownText = Array.isArray(stepBreakdown) && stepBreakdown.length > 0
+                  ? stepBreakdown
+                    .map((step, idx) => {
+                      const stepNumber = Number.isFinite(Number(step?.step)) ? Number(step.step) : (idx + 1);
+                      const line = String(step?.studentLine || '').trim() || '[empty OCR line]';
+                      const status = String(step?.status || 'partial').trim().toLowerCase();
+                      const loss = Number.isFinite(Number(step?.marksLost)) ? Number(step.marksLost) : 0;
+                      const note = String(step?.note || '').trim();
+                      return `Step ${stepNumber}: ${line} | status=${status} | marksLost=${loss}${note ? ` | note=${note}` : ''}`;
+                    })
+                    .join('\n')
+                  : 'Not provided';
+
+                prompt = `I got this long-answer question wrong from my uploaded photo:\n\nQuestion: ${question}\n\nDetected answer from photo: ${detectedAnswer || 'UNCLEAR'}\nMy uploaded work (OCR): ${studentWork || 'Not available'}\nExpected answer: ${expected}\nDifficulty: ${difficulty}\nMarks lost: ${Number.isFinite(Number(marksLost)) ? marksLost : 'unknown'}\n\nStep-by-step OCR with mark deductions:\n${stepBreakdownText}\n\nWhat went wrong in my steps: ${whatWentWrong || 'Not provided'}\nWhere marks were lost: ${whereLostMarks || 'Not provided'}\n\nPlease explain step-by-step where my method broke and how to avoid this mistake next time.`;
               }
               
               navigateToView('chat');
               handleSend(prompt);
+            }}
+            onAnalyzeLongAnswerPhoto={async (imageFile, question) => {
+              const gradingPrompt = [
+                'You are a strict math examiner grading a single long-answer response out of 5 marks.',
+                `Question: ${question?.prompt || ''}`,
+                `Expected final answer: ${question?.expected || ''}`,
+                'Read the handwritten solution in the image and detect where the student made a mistake.',
+                'Return ONLY valid JSON (no markdown, no extra text) with this exact schema:',
+                '{',
+                '  "finalAnswer": "string",',
+                '  "studentWork": "string",',
+                '  "isCorrect": true,',
+                '  "score": 0,',
+                '  "whatWentWrong": "1-2 lines describing the wrong step",',
+                '  "whereLostMarks": "1-2 lines describing the mark deduction points",',
+                '  "stepBreakdown": [',
+                '    { "step": 1, "studentLine": "string", "status": "correct", "marksLost": 0, "note": "string" }',
+                '  ]',
+                '}',
+                'Rules:',
+                '- score must be an integer from 0 to 5',
+                '- studentWork must contain the full OCR transcription line-by-line (do not summarize)',
+                '- stepBreakdown should cover the major lines from studentWork in order',
+                '- whereLostMarks must reference the step numbers where deductions happened',
+                '- status must be one of: correct, partial, incorrect, unreadable',
+                '- if text is unreadable, set finalAnswer to UNCLEAR, set isCorrect to false, and set score to 0',
+              ].join('\n');
+
+              const expectedAnswer = String(question?.expected || '').trim();
+              const resolvedOllamaUrl = String(settings.ollamaUrl || '').trim() || getDefaultOllamaProxyUrl();
+              const isProxyOllamaUrl = /\/api\/proxy\/ollama\/chat/i.test(resolvedOllamaUrl) || resolvedOllamaUrl.startsWith('/');
+              const imageMeta = {
+                fileName: String(imageFile?.name || ''),
+                mimeType: String(imageFile?.type || ''),
+                sizeBytes: Number(imageFile?.size || 0),
+                visionTransport: isProxyOllamaUrl ? 'offline-ollama-proxy' : 'offline-ollama-direct',
+                visionEndpoint: resolvedOllamaUrl,
+                aiModeAtCall: aiMode,
+                ocrModel: 'minicpm-v',
+                graderModel: String(settings.ollamaModel || 'deepseek-r1:7b'),
+              };
+
+              const normalizeForCompare = (value) => String(value || '')
+                .toLowerCase()
+                .replace(/\$+/g, '')
+                .replace(/\s+/g, '')
+                .trim();
+
+              const isUnclearAnswerText = (value) => {
+                const text = String(value || '').trim().toLowerCase();
+                return (
+                  isLowConfidenceOcrText(text)
+                  || text.includes('estimated')
+                  || text.includes('(demo)')
+                );
+              };
+
+              const deriveFinalAnswerFromWork = (workText = '') => {
+                const lines = String(workText || '')
+                  .replace(/\r\n/g, '\n')
+                  .split('\n')
+                  .map((line) => line.trim())
+                  .filter(Boolean);
+
+                if (lines.length === 0) return '';
+
+                const lastMeaningful = [...lines].reverse().find((line) => {
+                  const lower = line.toLowerCase();
+                  if (lower.startsWith('step ')) return false;
+                  if (lower.includes('[demo ocr]')) return false;
+                  return true;
+                });
+
+                return String(lastMeaningful || lines[lines.length - 1] || '').trim();
+              };
+
+              const getTranscriptLines = (workText = '') => String(workText || '')
+                .replace(/\r\n/g, '\n')
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean)
+                .filter((line) => {
+                  const lower = line.toLowerCase();
+                  if (lower === 'unclear') return false;
+                  if (isLowConfidenceOcrText(lower)) return false;
+                  if (lower.includes('[demo ocr]')) return false;
+                  return true;
+                });
+
+              const cleanAnswerCandidate = (candidate = '') => String(candidate || '')
+                .replace(/^[-*•]\s*/, '')
+                .replace(/^(?:final\s*answer|answer)\s*[:=]\s*/i, '')
+                .replace(/^\(+|\)+$/g, '')
+                .trim();
+
+              const inferFinalAnswerFromTranscript = (workText = '') => {
+                const lines = getTranscriptLines(workText);
+                if (lines.length === 0) return '';
+
+                for (let i = lines.length - 1; i >= 0; i -= 1) {
+                  const line = lines[i];
+                  const tagged = line.match(/(?:final\s*answer|answer)\s*[:=]\s*(.+)$/i);
+                  if (tagged?.[1]) {
+                    const cleaned = cleanAnswerCandidate(tagged[1]);
+                    if (cleaned && !isUnclearAnswerText(cleaned)) return cleaned;
+                  }
+                }
+
+                for (let i = lines.length - 1; i >= 0; i -= 1) {
+                  const line = lines[i];
+                  const eqIdx = line.lastIndexOf('=');
+                  if (eqIdx >= 0 && eqIdx < line.length - 1) {
+                    const rhs = cleanAnswerCandidate(line.slice(eqIdx + 1));
+                    if (rhs && !isUnclearAnswerText(rhs)) return rhs;
+                  }
+                }
+
+                const fallback = cleanAnswerCandidate(lines[lines.length - 1] || '');
+                return isUnclearAnswerText(fallback) ? '' : fallback;
+              };
+
+              const buildDemoStepBreakdown = (ocrText = '') => {
+                const lines = String(ocrText || '')
+                  .replace(/\r\n/g, '\n')
+                  .split('\n')
+                  .map((line) => line.trim())
+                  .filter(Boolean);
+
+                if (lines.length > 0) {
+                  return lines.map((line, idx) => {
+                    const isLast = idx === lines.length - 1;
+                    return {
+                      step: idx + 1,
+                      studentLine: line,
+                      status: isLast ? 'incorrect' : 'partial',
+                      marksLost: isLast ? 3 : 0,
+                      note: isLast
+                        ? (expectedAnswer ? `Final line could not be verified against ${expectedAnswer}.` : 'Final line could not be verified clearly.')
+                        : 'Extracted from OCR; minor ambiguity remains.',
+                    };
+                  });
+                }
+
+                return [
+                  {
+                    step: 1,
+                    studentLine: '[OCR] Handwritten steps could not be read clearly from the uploaded image.',
+                    status: 'unreadable',
+                    marksLost: 5,
+                    note: 'Upload a clearer photo (good lighting, full page in frame, no blur) for accurate grading.',
+                  },
+                ];
+              };
+
+              const buildDemoFinalAnswer = (ocrText = '') => {
+                const lines = String(ocrText || '')
+                  .replace(/\r\n/g, '\n')
+                  .split('\n')
+                  .map((line) => line.trim())
+                  .filter(Boolean);
+
+                if (lines.length > 0) {
+                  const tail = lines[lines.length - 1];
+                  return tail.length > 72 ? `${tail.slice(0, 69)}...` : tail;
+                }
+
+                return 'UNCLEAR';
+              };
+
+              const attachDebugPayload = (analysis, debugInfo = {}) => {
+                if (!analysis || typeof analysis !== 'object') return analysis;
+                const existingDebug = analysis._debug && typeof analysis._debug === 'object'
+                  ? analysis._debug
+                  : {};
+
+                return {
+                  ...analysis,
+                  _debug: {
+                    ...existingDebug,
+                    ...debugInfo,
+                  },
+                };
+              };
+
+              const toStepEntries = (rawStepBreakdown) => {
+                if (Array.isArray(rawStepBreakdown)) return rawStepBreakdown;
+                if (rawStepBreakdown === null || rawStepBreakdown === undefined) return [];
+
+                if (typeof rawStepBreakdown === 'string') {
+                  const trimmed = rawStepBreakdown.trim();
+                  if (!trimmed) return [];
+
+                  try {
+                    const parsed = JSON.parse(trimmed);
+                    return toStepEntries(parsed);
+                  } catch {
+                    // Not JSON, treat as plain text lines.
+                  }
+
+                  return trimmed
+                    .replace(/\r\n/g, '\n')
+                    .split('\n')
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .map((line, index) => ({ step: index + 1, studentLine: line }));
+                }
+
+                if (typeof rawStepBreakdown === 'object') {
+                  const nestedArrays = [
+                    rawStepBreakdown.stepBreakdown,
+                    rawStepBreakdown.steps,
+                    rawStepBreakdown.stepResults,
+                    rawStepBreakdown.lines,
+                    rawStepBreakdown.items,
+                    rawStepBreakdown.entries,
+                  ];
+
+                  for (const candidate of nestedArrays) {
+                    if (Array.isArray(candidate)) return candidate;
+                  }
+
+                  const singletonLine = String(
+                    rawStepBreakdown.studentLine
+                    || rawStepBreakdown.line
+                    || rawStepBreakdown.stepText
+                    || rawStepBreakdown.text
+                    || rawStepBreakdown.content
+                    || rawStepBreakdown.ocrLine
+                    || rawStepBreakdown.extractedLine
+                    || ''
+                  ).trim();
+
+                  if (singletonLine) return [rawStepBreakdown];
+                }
+
+                return [];
+              };
+
+              const extractParsedStudentWork = (parsed, fallback = '') => {
+                if (!parsed || typeof parsed !== 'object') return String(fallback || '').trim();
+
+                const direct = String(
+                  parsed.studentWork
+                  ?? parsed.detectedWork
+                  ?? parsed.ocrText
+                  ?? parsed.fullText
+                  ?? parsed.transcript
+                  ?? parsed.solutionText
+                  ?? parsed.text
+                  ?? ''
+                ).trim();
+
+                if (direct) return direct;
+
+                const fromStepEntries = toStepEntries(
+                  parsed.stepBreakdown
+                  ?? parsed.steps
+                  ?? parsed.stepResults
+                  ?? parsed.lines
+                )
+                  .map((entry) => {
+                    if (typeof entry === 'string') return entry.trim();
+                    if (!entry || typeof entry !== 'object') return '';
+                    return String(
+                      entry.studentLine
+                      || entry.line
+                      || entry.stepText
+                      || entry.text
+                      || entry.content
+                      || entry.ocrLine
+                      || entry.extractedLine
+                      || ''
+                    ).trim();
+                  })
+                  .filter(Boolean);
+
+                if (fromStepEntries.length > 0) {
+                  return fromStepEntries.join('\n');
+                }
+
+                return String(fallback || '').trim();
+              };
+
+              const applyTranscriptHeuristics = (analysis, transcriptText = '') => {
+                if (!analysis || typeof analysis !== 'object') return analysis;
+
+                const transcript = String(transcriptText || analysis.studentWork || '').trim();
+                const normalizedTranscript = normalizeForCompare(transcript);
+                const normalizedExpected = normalizeForCompare(expectedAnswer);
+                const transcriptContainsExpected = Boolean(normalizedExpected)
+                  && normalizedExpected.length >= 3
+                  && normalizedTranscript.includes(normalizedExpected);
+
+                const inferredFinal = transcriptContainsExpected
+                  ? expectedAnswer
+                  : inferFinalAnswerFromTranscript(transcript);
+
+                if (!inferredFinal || isUnclearAnswerText(inferredFinal)) return analysis;
+
+                const inferredCorrect = transcriptContainsExpected
+                  || (Boolean(expectedAnswer)
+                    && normalizeForCompare(inferredFinal) === normalizeForCompare(expectedAnswer));
+
+                const existingSteps = toStepEntries(analysis.stepBreakdown);
+                const transcriptSteps = getTranscriptLines(transcript).map((line, idx) => ({
+                  step: idx + 1,
+                  studentLine: line,
+                  status: inferredCorrect ? 'correct' : 'partial',
+                  marksLost: inferredCorrect ? 0 : (idx === 0 ? 3 : 0),
+                  note: inferredCorrect ? 'Verified from OCR transcript.' : 'Extracted from OCR transcript; final line did not match expected answer.',
+                }));
+
+                if (inferredCorrect) {
+                  return {
+                    ...analysis,
+                    finalAnswer: inferredFinal,
+                    studentWork: transcript || String(analysis.studentWork || '').trim(),
+                    isCorrect: true,
+                    score: 5,
+                    whatWentWrong: 'Transcript final line matches the expected answer.',
+                    whereLostMarks: 'No marks were deducted.',
+                    stepBreakdown: existingSteps.length > 0
+                      ? existingSteps.map((step, idx) => ({
+                        step: Number.isFinite(Number(step?.step)) ? Number(step.step) : (idx + 1),
+                        studentLine: String(step?.studentLine || '').trim(),
+                        status: 'correct',
+                        marksLost: 0,
+                        note: String(step?.note || '').trim() || 'Verified from OCR transcript.',
+                      }))
+                      : transcriptSteps,
+                  };
+                }
+
+                const currentFinal = String(analysis.finalAnswer || '').trim();
+                if (isUnclearAnswerText(currentFinal)) {
+                  const numericScore = Number(analysis.score);
+                  const score = Number.isFinite(numericScore)
+                    ? Math.max(2, Math.min(5, Math.round(numericScore)))
+                    : 2;
+
+                  return {
+                    ...analysis,
+                    finalAnswer: inferredFinal,
+                    studentWork: transcript || String(analysis.studentWork || '').trim(),
+                    score,
+                    isCorrect: false,
+                    whatWentWrong: String(analysis.whatWentWrong || '').trim()
+                      || 'OCR extracted a plausible final line, but it did not match the expected answer.',
+                    whereLostMarks: String(analysis.whereLostMarks || '').trim()
+                      || 'Marks were deducted because the extracted final line did not match the expected answer.',
+                    stepBreakdown: existingSteps.length > 0 ? existingSteps : transcriptSteps,
+                  };
+                }
+
+                return analysis;
+              };
+
+              const coerceDemoAggressiveAnalysis = (analysis, sourceText = '') => {
+                const base = (analysis && typeof analysis === 'object') ? analysis : {};
+                const scoreRaw = Number(base.score);
+                const score = Number.isFinite(scoreRaw)
+                  ? Math.max(2, Math.min(4, Math.round(scoreRaw)))
+                  : 2;
+
+                let stepBreakdown = toStepEntries(
+                  base.stepBreakdown
+                  ?? base.steps
+                  ?? base.stepResults
+                  ?? base.lines
+                )
+                    .map((step, idx) => {
+                      if (typeof step === 'string') {
+                        const line = step.trim();
+                        if (!line) return null;
+                        return {
+                          step: idx + 1,
+                          studentLine: line,
+                          status: 'partial',
+                          marksLost: 0,
+                          note: '',
+                        };
+                      }
+
+                      if (!step || typeof step !== 'object') return null;
+
+                      return {
+                        step: Number.isFinite(Number(step.step ?? step.stepNumber ?? step.index ?? step.id))
+                          ? Math.max(1, Math.round(Number(step.step ?? step.stepNumber ?? step.index ?? step.id)))
+                          : (idx + 1),
+                        studentLine: String(
+                          step.studentLine
+                          || step.line
+                          || step.stepText
+                          || step.text
+                          || step.content
+                          || step.ocrLine
+                          || step.extractedLine
+                          || ''
+                        ).trim(),
+                        status: String(step.status || step.result || step.grade || 'partial').trim().toLowerCase() || 'partial',
+                        marksLost: Number.isFinite(Number(step.marksLost ?? step.markLoss ?? step.deduction ?? step.loss ?? step.marksDeducted))
+                          ? Math.max(0, Math.min(5, Math.round(Number(step.marksLost ?? step.markLoss ?? step.deduction ?? step.loss ?? step.marksDeducted))))
+                          : 0,
+                        note: String(step.note || step.feedback || step.reason || step.comment || '').trim(),
+                      };
+                    })
+                    .filter((step) => step && step.studentLine);
+
+                if (stepBreakdown.length === 0) {
+                  const inferredSource = String(
+                    base.studentWork
+                    || base.detectedWork
+                    || base.ocrText
+                    || sourceText
+                    || ''
+                  ).trim();
+                  stepBreakdown = buildDemoStepBreakdown(inferredSource);
+                }
+
+                const totalTargetLoss = 5 - score;
+                const assignedLoss = stepBreakdown.reduce((sum, step) => sum + (Number(step.marksLost) || 0), 0);
+                if (totalTargetLoss > assignedLoss && stepBreakdown.length > 0) {
+                  const delta = totalTargetLoss - assignedLoss;
+                  const anchor = stepBreakdown.findIndex((step) => step.status === 'incorrect' || step.status === 'unreadable');
+                  const targetIndex = anchor >= 0 ? anchor : (stepBreakdown.length - 1);
+                  const target = stepBreakdown[targetIndex];
+                  stepBreakdown[targetIndex] = {
+                    ...target,
+                    status: target.status === 'correct' ? 'partial' : target.status,
+                    marksLost: (Number(target.marksLost) || 0) + delta,
+                    note: target.note || 'This is the main deduction point in demo-aggressive grading.',
+                  };
+                }
+
+                const deductedSteps = stepBreakdown
+                  .filter((step) => Number(step.marksLost) > 0)
+                  .map((step) => step.step);
+
+                const fallbackSource = String(
+                  base.studentWork
+                  || base.detectedWork
+                  || base.ocrText
+                  || sourceText
+                  || ''
+                ).trim();
+                const rawFinalAnswer = String(
+                  base.finalAnswer
+                  || base.answer
+                  || base.studentAnswer
+                  || base.final_answer
+                  || base.finalAnswerText
+                  || ''
+                ).trim();
+                const recoveredFinalFromWork = deriveFinalAnswerFromWork(fallbackSource);
+                const finalAnswer = !isUnclearAnswerText(rawFinalAnswer)
+                  ? rawFinalAnswer
+                  : (recoveredFinalFromWork || buildDemoFinalAnswer(fallbackSource));
+                const studentWork = String(base.studentWork || '').trim() || stepBreakdown.map((step) => step.studentLine).join('\n').trim();
+                const whatWentWrong = String(base.whatWentWrong || '').trim()
+                  || 'Demo-aggressive grading is enabled: the image evidence is treated as uncertain, so partial credit is awarded conservatively.';
+                const whereLostMarks = String(base.whereLostMarks || '').trim()
+                  || (deductedSteps.length > 0
+                    ? `Partial marks were awarded, but deductions were applied at step(s) ${deductedSteps.join(', ')} due to low-confidence verification.`
+                    : 'Partial marks were awarded, but deductions were applied where transformations could not be fully verified from the image.');
+
+                return {
+                  finalAnswer,
+                  studentWork,
+                  isCorrect: false,
+                  score,
+                  whatWentWrong,
+                  whereLostMarks,
+                  stepBreakdown,
+                };
+              };
+
+              const shouldKeepModelAnalysis = (analysis) => {
+                if (!analysis || typeof analysis !== 'object') return false;
+
+                const finalAnswer = String(analysis.finalAnswer || '').trim();
+                const studentWork = String(analysis.studentWork || '').trim();
+                const stepEntries = toStepEntries(
+                  analysis.stepBreakdown
+                  ?? analysis.steps
+                  ?? analysis.stepResults
+                  ?? analysis.lines
+                );
+
+                const hasStepText = stepEntries.some((entry) => {
+                  if (typeof entry === 'string') return entry.trim().length > 0;
+                  if (!entry || typeof entry !== 'object') return false;
+                  return String(
+                    entry.studentLine
+                    || entry.line
+                    || entry.stepText
+                    || entry.text
+                    || entry.content
+                    || entry.ocrLine
+                    || entry.extractedLine
+                    || ''
+                  ).trim().length > 0;
+                });
+
+                const scoreNum = Number(analysis.score);
+                const modelMarkedCorrect = analysis.isCorrect === true || (Number.isFinite(scoreNum) && scoreNum >= 5);
+                const hasStrongEvidence = studentWork.length >= 20 || hasStepText;
+                const looksDemoSynthetic = /\[demo ocr\]|\(demo\)|estimated\s+answer/i.test(`${finalAnswer}\n${studentWork}`);
+                const recoveredFinal = !isUnclearAnswerText(finalAnswer)
+                  ? finalAnswer
+                  : deriveFinalAnswerFromWork(studentWork);
+                const finalLooksClear = recoveredFinal
+                  && !/estimated\s+around|estimated\s+answer/i.test(recoveredFinal.toLowerCase());
+                const inferredCorrectFromFinal = Boolean(expectedAnswer)
+                  && Boolean(recoveredFinal)
+                  && normalizeForCompare(recoveredFinal) === normalizeForCompare(expectedAnswer);
+
+                if (looksDemoSynthetic) return false;
+                if (modelMarkedCorrect && hasStrongEvidence) return true;
+                if (inferredCorrectFromFinal && hasStrongEvidence) return true;
+                if (hasStrongEvidence && finalLooksClear) return true;
+                return false;
+              };
+
+              const buildDemoFallbackAnalysis = (ocrText = '') => {
+                const stepBreakdown = buildDemoStepBreakdown(ocrText);
+                const studentWork = stepBreakdown.map((step) => step.studentLine).join('\n').trim();
+                const finalAnswer = buildDemoFinalAnswer(ocrText);
+                const deductedSteps = stepBreakdown.filter((step) => Number(step.marksLost) > 0).map((step) => step.step);
+
+                const fallback = {
+                  finalAnswer,
+                  studentWork,
+                  isCorrect: false,
+                  score: 0,
+                  whatWentWrong: 'OCR confidence is too low to verify the student steps reliably.',
+                  whereLostMarks: deductedSteps.length > 0
+                    ? `Most marks were deducted at step(s) ${deductedSteps.join(', ')} where the transformation/final verification was unclear.`
+                    : 'Most marks were deducted where the method could not be verified from OCR.',
+                  stepBreakdown,
+                };
+
+                const transcriptRefined = applyTranscriptHeuristics(fallback, ocrText);
+
+                return DEMO_AGGRESSIVE_LONG_ANSWER
+                  ? coerceDemoAggressiveAnalysis(transcriptRefined, ocrText)
+                  : transcriptRefined;
+              };
+
+              const enrichParsedAnalysis = (parsed, ocrText = '') => {
+                if (!parsed || typeof parsed !== 'object') {
+                  return buildDemoFallbackAnalysis(ocrText);
+                }
+
+                const parsedStudentWork = extractParsedStudentWork(parsed, ocrText);
+                const parsedStepBreakdown = toStepEntries(
+                  parsed.stepBreakdown
+                  ?? parsed.steps
+                  ?? parsed.stepResults
+                  ?? parsed.lines
+                );
+
+                const parsedFinalRaw = String(
+                  parsed.finalAnswer
+                  ?? parsed.answer
+                  ?? parsed.studentAnswer
+                  ?? parsed.final_answer
+                  ?? parsed.finalAnswerText
+                  ?? ''
+                ).trim();
+
+                const recoveredFinalFromWork = deriveFinalAnswerFromWork(parsedStudentWork || ocrText);
+                const resolvedFinalAnswer = !isUnclearAnswerText(parsedFinalRaw)
+                  ? parsedFinalRaw
+                  : recoveredFinalFromWork;
+
+                const inferredCorrectFromFinal = Boolean(expectedAnswer)
+                  && Boolean(resolvedFinalAnswer)
+                  && normalizeForCompare(resolvedFinalAnswer) === normalizeForCompare(expectedAnswer);
+
+                const demo = buildDemoFallbackAnalysis(
+                  parsedStudentWork || ocrText
+                );
+
+                const parsedScore = Number(parsed.score);
+                const parsedIsCorrect = typeof parsed.isCorrect === 'boolean' ? parsed.isCorrect : false;
+                const resolvedIsCorrect = parsedIsCorrect || inferredCorrectFromFinal;
+                const resolvedScore = Number.isFinite(parsedScore)
+                  ? Math.max(0, Math.min(5, Math.round(parsedScore)))
+                  : (resolvedIsCorrect ? 5 : demo.score);
+
+                const normalized = {
+                  finalAnswer: resolvedFinalAnswer || demo.finalAnswer,
+                  studentWork: parsedStudentWork || demo.studentWork,
+                  isCorrect: resolvedIsCorrect || demo.isCorrect,
+                  score: resolvedScore,
+                  whatWentWrong: String(parsed.whatWentWrong || parsed.stepError || '').trim() || demo.whatWentWrong,
+                  whereLostMarks: String(parsed.whereLostMarks || parsed.markDeduction || '').trim() || demo.whereLostMarks,
+                  stepBreakdown: parsedStepBreakdown.length > 0 ? parsedStepBreakdown : demo.stepBreakdown,
+                };
+
+                const transcriptRefined = applyTranscriptHeuristics(normalized, parsedStudentWork || ocrText);
+
+                if (shouldKeepModelAnalysis(transcriptRefined)) {
+                  return transcriptRefined;
+                }
+
+                return DEMO_AGGRESSIVE_LONG_ANSWER
+                  ? coerceDemoAggressiveAnalysis(transcriptRefined, ocrText)
+                  : transcriptRefined;
+              };
+
+              let extractedText = '';
+              let localRaw = '';
+              let repairRaw = '';
+              let offlineTextModelInput = '';
+              let ocrAttemptTrace = [];
+              let ocrSource = 'none';
+
+              const questionId = String(question?.id || '').trim() || 'unknown';
+              const boundPrompt = String(question?.prompt || '').trim() || 'No question text provided';
+              const boundExpected = expectedAnswer || 'No expected answer provided';
+              const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+              const allowOnlineVision = isOnline && settings.aiMode !== 'offline';
+              const preferLocalGrading = !allowOnlineVision;
+
+              // Stage 1A: online vision OCR (same family of path as normal chat image flow).
+              if (allowOnlineVision) {
+                try {
+                  const imagePayload = await fileToImagePayload(imageFile);
+                  const onlinePrompt = `${OCR_STRICT_TRANSCRIBE_PROMPT}\n\nContext question:\n${boundPrompt}\n\nReturn only the transcription text.`;
+                  const onlineExtract = String(
+                    await analyzeImage(imagePayload.dataUrl || imagePayload.base64, onlinePrompt)
+                  ).trim();
+
+                  const onlineLowConfidence = isLowConfidenceOcrText(onlineExtract);
+                  ocrAttemptTrace.push({
+                    label: 'azure-online',
+                    promptMode: 'strict-transcribe',
+                    text: onlineExtract,
+                    lowConfidence: onlineLowConfidence,
+                  });
+
+                  if (onlineExtract && !onlineLowConfidence) {
+                    extractedText = onlineExtract;
+                    ocrSource = 'azure-online';
+                  } else if (onlineExtract && !extractedText) {
+                    extractedText = onlineExtract;
+                    ocrSource = 'azure-online-low';
+                  }
+                } catch (err) {
+                  ocrAttemptTrace.push({
+                    label: 'azure-online',
+                    promptMode: 'strict-transcribe',
+                    text: '',
+                    lowConfidence: true,
+                    error: String(err?.message || err || 'Online OCR failed'),
+                  });
+                }
+              }
+
+              // Stage 1B: local minicpm-v OCR retries as fallback and tie-breaker.
+              try {
+                const offlineExtract = await extractMathWithRetries(imageFile, { ollamaUrl: settings.ollamaUrl });
+                const localText = String(offlineExtract?.text || '').trim();
+                const localAttempts = Array.isArray(offlineExtract?.attempts) ? offlineExtract.attempts : [];
+                ocrAttemptTrace = [...ocrAttemptTrace, ...localAttempts];
+
+                const localLowConfidence = isLowConfidenceOcrText(localText);
+                const currentLowConfidence = isLowConfidenceOcrText(extractedText);
+
+                // Prefer local transcript only when it is clearly stronger than the current candidate.
+                if (localText && (!extractedText || (currentLowConfidence && !localLowConfidence))) {
+                  extractedText = localText;
+                  ocrSource = String(offlineExtract?.source || 'local-unknown');
+                } else if (!ocrSource && localText) {
+                  ocrSource = String(offlineExtract?.source || 'local-unknown');
+                }
+              } catch (err) {
+                console.warn('[MathWorkspace] Long-answer OCR extraction failed:', err?.message || err);
+              }
+
+              if (!extractedText) {
+                const fallback = buildDemoFallbackAnalysis('');
+                return attachDebugPayload(
+                  {
+                    ...fallback,
+                    studentWork: fallback.studentWork,
+                  },
+                  {
+                    source: 'offline',
+                    branch: 'minicpmv-ocr-unreadable',
+                    rawModelResponseText: '',
+                    parsedModelResponse: null,
+                    extractedText: extractedText || '',
+                    visionPromptText: VISION_REQUEST_PROMPT,
+                    textModelInput: '',
+                    ocrSource,
+                    ocrAttempts: ocrAttemptTrace,
+                    imageMeta: {
+                      ...imageMeta,
+                      questionId,
+                      questionPrompt: boundPrompt,
+                      expectedAnswer: boundExpected,
+                    },
+                  }
+                );
+              }
+
+              try {
+                const lowConfidenceTranscript = isLowConfidenceOcrText(extractedText);
+                const transcript = extractedText || 'UNREADABLE';
+
+                const offlineMessages = [
+                  {
+                    role: 'system',
+                    content: lowConfidenceTranscript
+                      ? 'You are a strict math examiner. The OCR transcript may be noisy. Use any visible mathematical content to extract the most likely final answer and step lines; if still impossible, return UNCLEAR. Return ONLY valid JSON with keys: finalAnswer, studentWork, isCorrect, score, whatWentWrong, whereLostMarks, stepBreakdown. No markdown and no extra text.'
+                      : 'You are a strict math examiner. Grade ONLY from the provided OCR transcript and question binding. Return ONLY valid JSON with keys: finalAnswer, studentWork, isCorrect, score, whatWentWrong, whereLostMarks, stepBreakdown. No markdown and no extra text.',
+                  },
+                  {
+                    role: 'user',
+                    content: `${gradingPrompt}\n\nQuestion binding:\n- Question ID: ${questionId}\n- Question text: ${boundPrompt}\n- Expected final answer: ${boundExpected}\n\nOCR transcript from minicpm-v (grade only from this transcript):\n${transcript}`,
+                  },
+                ];
+                offlineTextModelInput = String(offlineMessages?.[1]?.content || '');
+
+                localRaw = await streamChat(offlineMessages, {
+                  temperature: 0.1,
+                  maxTokens: 700,
+                  preferLocal: preferLocalGrading,
+                });
+
+                const localParsed = parseJsonObjectFromText(localRaw);
+                if (localParsed) {
+                  const normalized = enrichParsedAnalysis(localParsed, extractedText);
+                  // Keep grader anchored to the exact minicpm-v transcript for downstream review/debug.
+                  const pinnedTranscript = extractedText || String(normalized.studentWork || '').trim();
+
+                  return attachDebugPayload(
+                    {
+                      ...normalized,
+                      studentWork: pinnedTranscript,
+                    },
+                    {
+                      source: 'offline',
+                      branch: 'minicpmv-to-deepseek-parsed',
+                      rawModelResponseText: String(localRaw || ''),
+                      parsedModelResponse: localParsed,
+                      extractedText: extractedText || '',
+                      visionPromptText: VISION_REQUEST_PROMPT,
+                      textModelInput: offlineTextModelInput,
+                      ocrSource,
+                      ocrAttempts: ocrAttemptTrace,
+                      imageMeta: {
+                        ...imageMeta,
+                        questionId: String(question?.id || ''),
+                        questionPrompt: boundPrompt,
+                        expectedAnswer: boundExpected,
+                      },
+                    }
+                  );
+                }
+
+                // If the grader emits non-JSON text, run one repair pass to coerce strict JSON.
+                const repairMessages = [
+                  {
+                    role: 'system',
+                    content: 'Convert the provided grading output into strict JSON only. Return ONLY valid JSON with keys: finalAnswer, studentWork, isCorrect, score, whatWentWrong, whereLostMarks, stepBreakdown. No markdown, no commentary.',
+                  },
+                  {
+                    role: 'user',
+                    content: `Question: ${boundPrompt}\nExpected final answer: ${boundExpected}\nOCR transcript:\n${transcript}\n\nRaw grader output to convert:\n${String(localRaw || '').trim() || '[empty]'}`,
+                  },
+                ];
+
+                repairRaw = await streamChat(repairMessages, {
+                  temperature: 0,
+                  maxTokens: 500,
+                  preferLocal: preferLocalGrading,
+                });
+
+                const repairedParsed = parseJsonObjectFromText(repairRaw);
+                if (repairedParsed) {
+                  const normalized = enrichParsedAnalysis(repairedParsed, extractedText);
+                  const pinnedTranscript = extractedText || String(normalized.studentWork || '').trim();
+
+                  return attachDebugPayload(
+                    {
+                      ...normalized,
+                      studentWork: pinnedTranscript,
+                    },
+                    {
+                      source: 'offline',
+                      branch: 'minicpmv-to-deepseek-repaired',
+                      rawModelResponseText: String(localRaw || ''),
+                      repairedModelResponseText: String(repairRaw || ''),
+                      parsedModelResponse: repairedParsed,
+                      extractedText: extractedText || '',
+                      visionPromptText: VISION_REQUEST_PROMPT,
+                      textModelInput: offlineTextModelInput,
+                      ocrSource,
+                      ocrAttempts: ocrAttemptTrace,
+                      gradingRoutePreference: preferLocalGrading ? 'local' : 'online',
+                      imageMeta: {
+                        ...imageMeta,
+                        questionId: String(question?.id || ''),
+                        questionPrompt: boundPrompt,
+                        expectedAnswer: boundExpected,
+                      },
+                    }
+                  );
+                }
+              } catch (err) {
+                console.warn('[MathWorkspace] DeepSeek long-answer grading parse failed:', err?.message || err);
+              }
+
+              const fallback = buildDemoFallbackAnalysis(extractedText);
+              return attachDebugPayload(
+                {
+                  ...fallback,
+                  studentWork: extractedText || fallback.studentWork,
+                },
+                {
+                  source: 'offline',
+                  branch: 'minicpmv-to-deepseek-fallback',
+                  rawModelResponseText: String(localRaw || ''),
+                  repairedModelResponseText: String(repairRaw || ''),
+                  parsedModelResponse: null,
+                  extractedText: extractedText || '',
+                  visionPromptText: VISION_REQUEST_PROMPT,
+                  textModelInput: offlineTextModelInput,
+                  ocrSource,
+                  ocrAttempts: ocrAttemptTrace,
+                  gradingRoutePreference: preferLocalGrading ? 'local' : 'online',
+                  imageMeta: {
+                    ...imageMeta,
+                    questionId: String(question?.id || ''),
+                    questionPrompt: String(question?.prompt || ''),
+                    expectedAnswer,
+                  },
+                }
+              );
             }}
             onSubmit={async ({ topicId, quizMode, mcqScore, mcqTotal, solveScore, solveMax, solveDetails }) => {
               const score = mcqScore + solveScore;
@@ -1225,6 +2207,8 @@ export default function MathWorkspace() {
               ].filter((s) => s.maxMarks > 0);
 
               const grade = percentage >= 90 ? 'A+' : percentage >= 80 ? 'A' : percentage >= 70 ? 'B' : percentage >= 60 ? 'C' : percentage >= 50 ? 'D' : 'F';
+              const solveFeedback = solveRatio >= 0.8 ? 'Excellent solving accuracy.' : 'Review the solving steps for improvement.';
+
               const nextResult = {
                 topicId,
                 quizMode,
@@ -1232,7 +2216,7 @@ export default function MathWorkspace() {
                 maxScore,
                 percentage,
                 stepResults,
-                feedback: `Quiz result: ${score}/${maxScore}. ${solveRatio >= 0.8 ? 'Excellent solving accuracy.' : 'Review the solving steps for improvement.'}`,
+                feedback: `Quiz result: ${score}/${maxScore}. ${solveFeedback}`,
                 grade,
                 mistakeTypes: solveRatio === 1 ? [] : ['incomplete_solving'],
               };
@@ -1320,15 +2304,37 @@ export default function MathWorkspace() {
               <MistakesPanel 
             topicId={selectedTopic || null}
             onAskAI={(mistake) => {
-              const { problem, description, type, difficulty, topic } = mistake;
+              const {
+                problem,
+                description,
+                type,
+                difficulty,
+                topic,
+                wrongOption,
+                wrongOptionText,
+                correctOption,
+                correctOptionText,
+                whyCorrect,
+                howToFind,
+                studentWork,
+                studentAnswer,
+                expectedAnswer,
+              } = mistake;
               const safeProblem = String(problem || '').replace(/\s+/g, ' ').trim();
               const safeDescription = String(description || '').replace(/\s+/g, ' ').trim();
+              const safeWrong = `${String(wrongOption || '').trim()} ${String(wrongOptionText || '').trim()}`.trim();
+              const safeCorrect = `${String(correctOption || '').trim()} ${String(correctOptionText || '').trim()}`.trim();
+              const safeWhyCorrect = String(whyCorrect || '').replace(/\s+/g, ' ').trim();
+              const safeHowToFind = String(howToFind || '').replace(/\s+/g, ' ').trim();
+              const safeStudentWork = String(studentWork || '').replace(/\s+/g, ' ').trim();
+              const safeStudentAnswer = String(studentAnswer || '').replace(/\s+/g, ' ').trim();
+              const safeExpectedAnswer = String(expectedAnswer || '').replace(/\s+/g, ' ').trim();
               let prompt = '';
               
               if (type === 'mcq') {
-                prompt = `Explain this MCQ mistake clearly and concisely.\n\nQuestion: ${safeProblem}\nMy mistake: ${safeDescription}\n\nRules:\n- Do NOT guess what the student was thinking.\n- Do NOT add fictional context or names.\n- Do NOT include self-reflection, internal reasoning, or "question for student" text.\n- Give only: correct option, why it is correct, and one short method to avoid this mistake.`;
+                prompt = `Explain this MCQ mistake clearly and concisely.\n\nQuestion: ${safeProblem}\nWrong option selected: ${safeWrong || safeDescription}\nCorrect option: ${safeCorrect || 'Not provided'}\nWhy correct option works: ${safeWhyCorrect || 'Not provided'}\nCurrent hint: ${safeHowToFind || 'Not provided'}\n\nRules:\n- Do NOT guess what the student was thinking.\n- Do NOT add fictional context or names.\n- Do NOT include self-reflection, internal reasoning, or "question for student" text.\n- Give only: correct option, why it is correct, and one short method to avoid this mistake.`;
               } else if (type === 'solve') {
-                prompt = `Explain this long-answer mistake step by step.\n\nQuestion: ${safeProblem}\nMy mistake: ${safeDescription}\nDifficulty: ${difficulty}\n\nRules:\n- Do NOT guess what the student was thinking.\n- No fictional context.\n- Do NOT include self-reflection or chain-of-thought style text.\n- Keep response focused on math steps and correction only.`;
+                prompt = `Explain this long-answer mistake step by step.\n\nQuestion: ${safeProblem}\nMy uploaded answer (OCR): ${safeStudentWork || 'Not available'}\nDetected final answer: ${safeStudentAnswer || 'Not available'}\nExpected answer: ${safeExpectedAnswer || 'Not available'}\nMy mistake: ${safeDescription}\nDifficulty: ${difficulty}\n\nRules:\n- Do NOT guess what the student was thinking.\n- No fictional context.\n- Do NOT include self-reflection or chain-of-thought style text.\n- Keep response focused on math steps and correction only.`;
               } else {
                 prompt = `Explain this mistake with only factual math guidance.\n\nQuestion: ${safeProblem}\nMistake: ${safeDescription}\n\nRules:\n- No speculative student psychology.\n- No internal reasoning text.\n- Provide direct correction steps only.`;
               }
@@ -1357,9 +2363,16 @@ export default function MathWorkspace() {
 
         {/* Graph Panel */}
         {chartData && (
-          <div className="graph-panel">
+          <div className="graph-panel" ref={graphPanelRef}>
             <React.Suspense fallback={VIEW_LOADER}>
-              <GraphPlotter chartData={chartData} equation={chartEquation} />
+              <GraphPlotter
+                chartData={chartData}
+                equation={chartEquation}
+                onEquationChange={(nextEquation, nextData) => {
+                  setChartEquation(nextEquation);
+                  setChartData(nextData);
+                }}
+              />
             </React.Suspense>
             <button className="graph-close" onClick={() => setChartData(null)}>✕</button>
           </div>
@@ -1374,14 +2387,6 @@ export default function MathWorkspace() {
           </React.Suspense>
         ) : (
           <div className="side-rail">
-            <div className="side-rail-card">
-              <h4>Live Chat Status</h4>
-              <div className="side-rail-row"><span>AI mode</span><b>{aiMode === 'online' ? 'Online' : 'Local'}</b></div>
-              <div className="side-rail-row"><span>Messages</span><b>{messages.length}</b></div>
-              <div className="side-rail-row"><span>Session</span><b>{activeSessionId ? 'Active' : 'None'}</b></div>
-              <div className="side-rail-row"><span>Storage</span><b>{isEphemeralMode ? 'Temporary' : 'Persistent'}</b></div>
-            </div>
-
             <div className="side-rail-card">
               <h4>Side Copilot</h4>
               <input
@@ -1440,6 +2445,7 @@ export default function MathWorkspace() {
                     className={`focus-preset-btn ${focusMinutes === m ? 'active' : ''}`}
                     onClick={() => {
                       setFocusMinutes(m);
+                      setCustomFocusMinutes(String(m));
                       setFocusRemaining(m * 60);
                       setFocusRunning(false);
                     }}
@@ -1447,6 +2453,30 @@ export default function MathWorkspace() {
                     {m}m
                   </button>
                 ))}
+              </div>
+              <div className="focus-custom-row">
+                <input
+                  className="focus-custom-input"
+                  type="number"
+                  min="1"
+                  max="180"
+                  step="1"
+                  value={customFocusMinutes}
+                  onChange={(e) => setCustomFocusMinutes(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      applyCustomSprintTimer(false);
+                    }
+                  }}
+                  placeholder="Custom minutes"
+                />
+                <button className="focus-custom-btn" onClick={() => applyCustomSprintTimer(false)}>
+                  Apply
+                </button>
+                <button className="focus-custom-btn active" onClick={() => applyCustomSprintTimer(true)}>
+                  Start
+                </button>
               </div>
               <div className="focus-actions">
                 <button className="side-rail-btn" onClick={() => setFocusRunning((value) => !value)}>

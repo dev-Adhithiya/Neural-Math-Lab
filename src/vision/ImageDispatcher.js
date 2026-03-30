@@ -2,7 +2,7 @@
  * ImageDispatcher — classify + route uploaded images.
  *
  * Classification model: Ollama `minicpm-v`
- * URL: http://localhost:11434/api/generate
+ * URL: /api/proxy/ollama/chat
  *
  * Returns one of:
  * - ERROR_NO_MATH
@@ -10,7 +10,9 @@
  * - TYPE_DOUBT (single question / doubt)
  */
 
-const OLLAMA_GENERATE_URL = 'http://localhost:11434/api/generate';
+import { getDefaultOllamaProxyUrl } from '../config/api.js';
+
+const OLLAMA_GENERATE_URL = getDefaultOllamaProxyUrl();
 export const IMAGE_CLASSIFIER_MODEL = 'minicpm-v';
 
 export const CLASSIFIER_PROMPT = `Analyze this image. If it contains NO math, return 'ERROR_NO_MATH'. If it is a completed problem, return 'TYPE_SUBMISSION'. If it is a single question, return 'TYPE_DOUBT'.`;
@@ -37,6 +39,15 @@ export const VISION_REQUEST_PROMPT = `Act as an expert math examiner and explici
 - If it is an equation or formula, write it out perfectly.
 Output the full context as a clear string of text.`;
 
+export const OCR_STRICT_TRANSCRIBE_PROMPT = `You are an OCR engine for math screenshots and handwritten work.
+Return ONLY the visible text and math expressions from the image, line by line.
+Rules:
+- Do not explain, classify, or summarize.
+- Keep equations exactly as written.
+- If a symbol is uncertain, keep the rest and use ? for the uncertain symbol.
+- Never answer with refusal text unless nothing is visible.
+- If absolutely nothing is readable, return exactly: UNREADABLE`;
+
 async function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -49,10 +60,44 @@ async function blobToBase64(blob) {
   });
 }
 
-export async function preprocessForOcr(imageBlob) {
+const OCR_LOW_CONFIDENCE_MARKERS = [
+  'error_no_content',
+  'unclear',
+  'unreadable',
+  'unable to transcribe',
+  'cannot transcribe',
+  "can't transcribe",
+  'unable to read',
+  'cannot read',
+  "can't read",
+  'could not read',
+  'not readable',
+  'not clearly visible',
+  'too blurry',
+  'low resolution',
+  'image quality',
+  'only available online',
+  'please reconnect',
+];
+
+export function isLowConfidenceOcrText(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return true;
+  return OCR_LOW_CONFIDENCE_MARKERS.some((marker) => text.includes(marker));
+}
+
+export async function preprocessForOcr(imageBlob, options = {}) {
+  const {
+    maxSize = 1024,
+    contrast = 1.18,
+    sharpen = true,
+    outputMime = 'image/jpeg',
+    outputQuality = 0.92,
+  } = options || {};
+
   // 1. Load image and optionally downscale large images
   const bmp = await createImageBitmap(imageBlob);
-  const MAX_SIZE = 1024;
+  const MAX_SIZE = Math.max(256, Number(maxSize) || 1024);
   let width = bmp.width;
   let height = bmp.height;
 
@@ -74,43 +119,46 @@ export async function preprocessForOcr(imageBlob) {
   const data = img.data;
 
   // Contrast boost
-  const contrast = 1.18;
-  const intercept = 128 * (1 - contrast);
+  const contrastValue = Number(contrast);
+  const contrastScale = Number.isFinite(contrastValue) ? contrastValue : 1.18;
+  const intercept = 128 * (1 - contrastScale);
   for (let i = 0; i < data.length; i += 4) {
-    data[i] = Math.max(0, Math.min(255, data[i] * contrast + intercept));
-    data[i + 1] = Math.max(0, Math.min(255, data[i + 1] * contrast + intercept));
-    data[i + 2] = Math.max(0, Math.min(255, data[i + 2] * contrast + intercept));
+    data[i] = Math.max(0, Math.min(255, data[i] * contrastScale + intercept));
+    data[i + 1] = Math.max(0, Math.min(255, data[i + 1] * contrastScale + intercept));
+    data[i + 2] = Math.max(0, Math.min(255, data[i + 2] * contrastScale + intercept));
   }
 
-  // Sharpen kernel
-  const w = canvas.width;
-  const h = canvas.height;
-  const src = new Uint8ClampedArray(data);
-  const k = [0, -1, 0, -1, 5, -1, 0, -1, 0];
+  if (sharpen) {
+    // Sharpen kernel helps on blurry handwriting; can hurt clean screenshots, so it is optional.
+    const w = canvas.width;
+    const h = canvas.height;
+    const src = new Uint8ClampedArray(data);
+    const k = [0, -1, 0, -1, 5, -1, 0, -1, 0];
 
-  const idx = (x, y) => (y * w + x) * 4;
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const out = [0, 0, 0];
-      let ki = 0;
-      for (let ky = -1; ky <= 1; ky++) {
-        for (let kx = -1; kx <= 1; kx++) {
-          const p = idx(x + kx, y + ky);
-          const kv = k[ki++];
-          out[0] += src[p] * kv;
-          out[1] += src[p + 1] * kv;
-          out[2] += src[p + 2] * kv;
+    const idx = (x, y) => (y * w + x) * 4;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const out = [0, 0, 0];
+        let ki = 0;
+        for (let ky = -1; ky <= 1; ky++) {
+          for (let kx = -1; kx <= 1; kx++) {
+            const p = idx(x + kx, y + ky);
+            const kv = k[ki++];
+            out[0] += src[p] * kv;
+            out[1] += src[p + 1] * kv;
+            out[2] += src[p + 2] * kv;
+          }
         }
+        const p0 = idx(x, y);
+        data[p0] = Math.max(0, Math.min(255, out[0]));
+        data[p0 + 1] = Math.max(0, Math.min(255, out[1]));
+        data[p0 + 2] = Math.max(0, Math.min(255, out[2]));
       }
-      const p0 = idx(x, y);
-      data[p0] = Math.max(0, Math.min(255, out[0]));
-      data[p0 + 1] = Math.max(0, Math.min(255, out[1]));
-      data[p0 + 2] = Math.max(0, Math.min(255, out[2]));
     }
   }
 
   ctx.putImageData(img, 0, 0);
-  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, outputMime, outputQuality));
   return blob || imageBlob;
 }
 
@@ -187,14 +235,14 @@ export async function classifyImageWithMoondream(imageBlob, { ollamaUrl = OLLAMA
   return normalizeClass(raw) || 'TYPE_DOUBT';
 }
 
-export async function extractMathWithMoondream(imageBlob, { ollamaUrl = OLLAMA_GENERATE_URL } = {}) {
+export async function extractMathWithMoondream(imageBlob, { ollamaUrl = OLLAMA_GENERATE_URL, prompt = VISION_REQUEST_PROMPT } = {}) {
   const b64 = await blobToBase64(imageBlob);
   const res = await fetch(ollamaUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: IMAGE_CLASSIFIER_MODEL,
-      prompt: VISION_REQUEST_PROMPT,
+      prompt,
       stream: false,
       images: [b64],
       options: {
@@ -206,6 +254,98 @@ export async function extractMathWithMoondream(imageBlob, { ollamaUrl = OLLAMA_G
   if (!res.ok) throw new Error(`Ollama OCR ${res.status}: ${await res.text()}`);
   const json = await res.json();
   return { text: String(json?.response || '').trim(), raw: json };
+}
+
+export async function extractMathWithRetries(imageBlob, { ollamaUrl = OLLAMA_GENERATE_URL } = {}) {
+  const attempts = [];
+  let fallbackText = '';
+  let fallbackRaw = null;
+  let fallbackSource = 'none';
+
+  const runAttempt = async (label, blobFactory, prompt) => {
+    try {
+      const candidateBlob = await blobFactory();
+      const extracted = await extractMathWithMoondream(candidateBlob, { ollamaUrl, prompt });
+      const text = String(extracted?.text || '').trim();
+      const lowConfidence = isLowConfidenceOcrText(text);
+
+      attempts.push({
+        label,
+        promptMode: prompt === OCR_STRICT_TRANSCRIBE_PROMPT ? 'strict-transcribe' : 'legacy-transcribe',
+        text,
+        lowConfidence,
+      });
+
+      if (!fallbackText && text) {
+        fallbackText = text;
+        fallbackRaw = extracted?.raw || null;
+        fallbackSource = label;
+      }
+
+      if (text && !lowConfidence) {
+        return {
+          text,
+          raw: extracted?.raw || null,
+          source: label,
+          attempts,
+        };
+      }
+    } catch (error) {
+      attempts.push({
+        label,
+        promptMode: prompt === OCR_STRICT_TRANSCRIBE_PROMPT ? 'strict-transcribe' : 'legacy-transcribe',
+        text: '',
+        lowConfidence: true,
+        error: String(error?.message || error || 'OCR attempt failed'),
+      });
+    }
+
+    return null;
+  };
+
+  const attemptOrder = [
+    {
+      label: 'original',
+      prompt: OCR_STRICT_TRANSCRIBE_PROMPT,
+      buildBlob: async () => imageBlob,
+    },
+    {
+      label: 'original-legacy',
+      prompt: VISION_REQUEST_PROMPT,
+      buildBlob: async () => imageBlob,
+    },
+    {
+      label: 'preprocess-soft',
+      prompt: OCR_STRICT_TRANSCRIBE_PROMPT,
+      buildBlob: async () => preprocessForOcr(imageBlob, {
+        contrast: 1.06,
+        sharpen: false,
+        outputMime: 'image/png',
+      }),
+    },
+    {
+      label: 'preprocess-strong',
+      prompt: OCR_STRICT_TRANSCRIBE_PROMPT,
+      buildBlob: async () => preprocessForOcr(imageBlob),
+    },
+    {
+      label: 'preprocess-strong-legacy',
+      prompt: VISION_REQUEST_PROMPT,
+      buildBlob: async () => preprocessForOcr(imageBlob),
+    },
+  ];
+
+  for (const attempt of attemptOrder) {
+    const ok = await runAttempt(attempt.label, attempt.buildBlob, attempt.prompt);
+    if (ok) return ok;
+  }
+
+  return {
+    text: fallbackText,
+    raw: fallbackRaw,
+    source: fallbackSource,
+    attempts,
+  };
 }
 
 export function getLastMessageType(chatMessages = []) {

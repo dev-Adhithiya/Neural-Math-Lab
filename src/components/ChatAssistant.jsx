@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { renderMathInText } from './StreamingText.jsx';
 
 /**
@@ -118,14 +118,33 @@ export default function ChatAssistant({
     { id: 'report', icon: '📊', label: 'My Report', desc: 'View your progress report' },
   ];
 
-  const escapeHtml = (text) => {
-    return String(text || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  };
+  const balanceStreamingText = useCallback((text) => {
+    let safe = String(text || '');
+    if (!safe) return '';
+
+    const fenceCount = (safe.match(/```/g) || []).length;
+    if (fenceCount % 2 !== 0) {
+      safe += '\n```';
+    }
+
+    const blockCount = (safe.match(/\$\$/g) || []).length;
+    if (blockCount % 2 !== 0) {
+      safe += '\n$$';
+    }
+
+    const withoutBlocks = safe.replace(/\$\$/g, '');
+    const inlineCount = (withoutBlocks.match(/(?<!\\)\$/g) || []).length;
+    if (inlineCount % 2 !== 0) {
+      safe += '$';
+    }
+
+    return safe;
+  }, []);
+
+  const renderedStreamingText = useMemo(
+    () => renderMathInText(balanceStreamingText(streamingText)),
+    [streamingText, balanceStreamingText]
+  );
 
   return (
     <div className="chat-assistant">
@@ -203,7 +222,7 @@ export default function ChatAssistant({
             <div className="message-content">
               <div
                 className="message-text message-text-streaming"
-                dangerouslySetInnerHTML={{ __html: escapeHtml(streamingText) }}
+                dangerouslySetInnerHTML={{ __html: renderedStreamingText }}
               />
               <span className="typing-cursor">▊</span>
             </div>

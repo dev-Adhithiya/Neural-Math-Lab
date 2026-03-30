@@ -71,16 +71,28 @@ export function renderMathInText(text) {
   // Markdown: `code`
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
 
-  // Markdown: ### headers
-  html = html.replace(/^### (.+)$/gm, '<h4 class="chat-heading">$1</h4>');
-  html = html.replace(/^## (.+)$/gm, '<h3 class="chat-heading">$1</h3>');
+  // Markdown headers (accept optional leading whitespace and flexible spacing)
+  html = html.replace(/^\s*###\s*(.+)$/gm, '<h4 class="chat-heading">$1</h4>');
+  html = html.replace(/^\s*##\s*(.+)$/gm, '<h3 class="chat-heading">$1</h3>');
+  html = html.replace(/^\s*#\s*(.+)$/gm, '<h2 class="chat-heading">$1</h2>');
 
-  // Markdown: - list items
-  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-  html = html.replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`);
+  // Boxed steps for worked solutions.
+  html = html.replace(
+    /^(\d+)\.\s+(.+)$/gm,
+    '<div class="solution-step-box"><div class="solution-step-index">Step $1</div><div class="solution-step-body">$2</div></div>'
+  );
 
-  // Markdown: numbered lists
-  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+  html = html.replace(
+    /^([\-*•]\s+)?(Substitute[^\n:]*:|Evaluate[^\n:]*:|At\s+x\s*=\s*[^\n:]*:|Differentiate[^\n:]*:|Factor[^\n:]*:|Set\s+[^\n:]*:)/gim,
+    '<div class="solution-step-box"><div class="solution-step-body">$2</div></div>'
+  );
+
+  // Markdown bullet lists for non-step content.
+  html = html.replace(/^- (.+)$/gm, '<li class="message-list-item">$1</li>');
+  html = html.replace(
+    /(<li class="message-list-item">.*<\/li>\n?)+/g,
+    (match) => `<ul class="message-list">${match}</ul>`
+  );
 
   // Newlines → <br>
   html = html.replace(/\n/g, '<br />');

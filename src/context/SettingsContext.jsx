@@ -1,9 +1,12 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { getAllSettings, getProfile, setSetting, updateProfile } from '../store/localVault.js';
+import { API_PATHS, getDefaultOllamaProxyUrl, withApiBase } from '../config/api.js';
 
 const SettingsContext = createContext(null);
 
 function getEnvDefaults() {
+  const envOllamaUrl = String(import.meta.env.VITE_OLLAMA_URL || '').trim();
+
   return {
     theme: 'dark', // 'dark' | 'light'
     studentName: import.meta.env.VITE_STUDENT_NAME || 'Student',
@@ -19,8 +22,8 @@ function getEnvDefaults() {
     azureSearchKey: import.meta.env.VITE_AZURE_SEARCH_KEY || '',
     azureSearchIndex: import.meta.env.VITE_AZURE_SEARCH_INDEX || '',
 
-    // Local provider (Ollama)
-    ollamaUrl: import.meta.env.VITE_OLLAMA_URL || 'http://localhost:11434/api/generate',
+    // Local provider (Ollama via proxy by default)
+    ollamaUrl: envOllamaUrl ? withApiBase(envOllamaUrl) : getDefaultOllamaProxyUrl(),
     ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'deepseek-r1:7b',
 
     // Safety / governance
@@ -37,6 +40,15 @@ function mergeSettings(defaults, stored, profile) {
   // One-time migration from old local default.
   if (!merged.ollamaModel || merged.ollamaModel === 'phi3:mini') {
     merged.ollamaModel = 'deepseek-r1:7b';
+  }
+  const currentOllamaUrl = String(merged.ollamaUrl || '').trim();
+  if (!currentOllamaUrl) {
+    merged.ollamaUrl = getDefaultOllamaProxyUrl();
+  } else {
+    const proxyPathRe = new RegExp(`^${API_PATHS.ollamaChat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[?#/])`, 'i');
+    if (proxyPathRe.test(currentOllamaUrl)) {
+      merged.ollamaUrl = withApiBase(currentOllamaUrl);
+    }
   }
   // Auto-pick provider if user has one key but not the other
   if (merged.provider !== 'azure' && merged.provider !== 'gemini') {

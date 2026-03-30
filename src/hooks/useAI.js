@@ -11,6 +11,7 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { BrainSwitch } from '../providers/BrainSwitch.js';
+import { getDefaultOllamaProxyUrl } from '../config/api.js';
 
 function createThoughtFilter() {
   let inHiddenBlock = false;
@@ -126,7 +127,7 @@ export function useAI(appSettings = {}) {
       azureSearchKey: appSettings.azureSearchKey || '',
       azureSearchIndex: appSettings.azureSearchIndex || '',
 
-      ollamaUrl: appSettings.ollamaUrl || 'http://localhost:11434/api/generate',
+      ollamaUrl: appSettings.ollamaUrl || getDefaultOllamaProxyUrl(),
       ollamaModel: appSettings.ollamaModel || 'deepseek-r1:7b',
       strictMode: appSettings.strictMode !== false,
     });

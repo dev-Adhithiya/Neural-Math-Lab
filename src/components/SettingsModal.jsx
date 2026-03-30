@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useSettings } from '../context/SettingsContext.jsx';
 import { exportAllData, resetAllData } from '../store/localVault.js';
+import { getDefaultOllamaProxyUrl } from '../config/api.js';
 
 export default function SettingsModal({ isOpen, onClose }) {
   const { settings, updateSettings, isLoaded } = useSettings();
   const [draft, setDraft] = useState(settings);
   const [saving, setSaving] = useState(false);
   const [revealKeys, setRevealKeys] = useState(false);
+  const defaultOllamaProxyUrl = useMemo(() => getDefaultOllamaProxyUrl(), []);
 
   const maskedAzureKey = useMemo(() => (settings.azureKey ? '••••••••••••••••' : ''), [settings.azureKey]);
   const maskedGeminiKey = useMemo(() => (settings.geminiKey ? '••••••••••••••••' : ''), [settings.geminiKey]);
@@ -39,7 +41,7 @@ export default function SettingsModal({ isOpen, onClose }) {
         azureSearchKey: (draft.azureSearchKey || '').trim(),
         azureSearchIndex: (draft.azureSearchIndex || '').trim(),
 
-        ollamaUrl: (draft.ollamaUrl || '').trim() || 'http://localhost:11434/api/generate',
+        ollamaUrl: (draft.ollamaUrl || '').trim() || defaultOllamaProxyUrl,
         ollamaModel: (draft.ollamaModel || '').trim() || 'deepseek-r1:7b',
         strictMode: draft.strictMode !== false,
         retentionEnabled: draft.retentionEnabled !== false,
@@ -237,7 +239,7 @@ export default function SettingsModal({ isOpen, onClose }) {
             <input
               value={draft.ollamaUrl || ''}
               onChange={set('ollamaUrl')}
-              placeholder="http://localhost:11434/api/generate"
+              placeholder={defaultOllamaProxyUrl}
             />
           </div>
           <div className="settings-field">

@@ -9,12 +9,21 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PROXY_PORT || 8787);
 const STRICT_MODE_DEFAULT = String(process.env.STRICT_MODE || 'true').toLowerCase() === 'true';
+const CORS_ORIGIN = String(process.env.CORS_ORIGIN || '').trim();
 
 // Initialize response cache (500 entries, 1-hour TTL)
 const responseCache = new ResponseCache(500, 3600000);
 
-app.use(cors());
-app.use(express.json({ limit: '8mb' }));
+const allowedOrigins = CORS_ORIGIN
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const corsOptions = allowedOrigins.length === 0 || allowedOrigins.includes('*')
+  ? {}
+  : { origin: allowedOrigins };
+
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '30mb' }));
 
 function extractText(value) {
   if (!value) return '';
@@ -180,11 +189,16 @@ app.post('/api/proxy/rag/search', policyGuard, async (req, res) => {
 app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
   const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
   const userPrompt = req.body?.prompt || '';
+  const rawImages = Array.isArray(req.body?.images)
+    ? req.body.images.filter((img) => typeof img === 'string' && img.trim().length > 0)
+    : [];
+  const hasImages = rawImages.length > 0;
+  const canUsePromptCache = !hasImages;
 
   try {
     // ========== OPTIMIZATION 1: Check response cache ==========
-    const cachedResponse = responseCache.get(userPrompt);
-    if (cachedResponse) {
+    const cachedResponse = canUsePromptCache ? responseCache.get(userPrompt) : null;
+    if (canUsePromptCache && cachedResponse) {
       const cacheData = {
         model: req.body?.model || process.env.OLLAMA_MODEL || 'deepseek-r1:7b',
         response: cachedResponse,
@@ -206,36 +220,55 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
     }
 
     // ========== OPTIMIZATION 2: Select inference profile ==========
-    const profile = selectInferenceProfile(userPrompt);
-    const inferenceOptions = INFERENCE_PROFILES[profile] || INFERENCE_PROFILES.balanced;
-    
+    const profile = hasImages ? 'vision-pass-through' : selectInferenceProfile(userPrompt);
+    const inferenceOptions = hasImages
+      ? null
+      : (INFERENCE_PROFILES[profile] || INFERENCE_PROFILES.balanced);
+
     // ========== OPTIMIZATION 3: Get optimized system prompt ==========
-    const systemPrompt = getOptimizedSystemPrompt(profile);
-    const optimizedUser = formatOptimizedPrompt(userPrompt, profile);
+    const systemPrompt = hasImages ? '' : getOptimizedSystemPrompt(profile);
+    const optimizedUser = hasImages ? userPrompt : formatOptimizedPrompt(userPrompt, profile);
     const modelStr = req.body?.model || process.env.OLLAMA_MODEL || 'deepseek-r1:7b';
-    
-    let formattedPrompt = `${systemPrompt}\n\nUser: ${optimizedUser}`;
-    let isRaw = false;
 
-    // We no longer bypass CoT for deepseek-r1 because it needs space to think,
-    // and bypassing it causes hallucinations/cutoffs.
-    if (modelStr.includes('deepseek-r1') && profile === 'ultra-fast-disabled') {
-      isRaw = true;
-      formattedPrompt = `<｜begin of sentence｜>${systemPrompt}<｜User｜>${optimizedUser}<｜Assistant｜><think>\n</think>\n`;
+    let body;
+    if (hasImages) {
+      // Vision calls must preserve the original prompt and carry image payloads through untouched.
+      body = {
+        model: modelStr,
+        prompt: userPrompt,
+        stream: req.body?.stream !== false,
+        keep_alive: req.body?.keep_alive || '10m',
+        images: rawImages,
+        options: {
+          temperature: 0,
+          num_gpu: 1,
+          ...req.body?.options,
+        },
+      };
+    } else {
+      let formattedPrompt = `${systemPrompt}\n\nUser: ${optimizedUser}`;
+      let isRaw = false;
+
+      // We no longer bypass CoT for deepseek-r1 because it needs space to think,
+      // and bypassing it causes hallucinations/cutoffs.
+      if (modelStr.includes('deepseek-r1') && profile === 'ultra-fast-disabled') {
+        isRaw = true;
+        formattedPrompt = `<｜begin of sentence｜>${systemPrompt}<｜User｜>${optimizedUser}<｜Assistant｜><think>\n</think>\n`;
+      }
+
+      body = {
+        model: modelStr,
+        system: isRaw ? undefined : systemPrompt,
+        prompt: formattedPrompt,
+        raw: isRaw,
+        stream: req.body?.stream !== false,
+        keep_alive: req.body?.keep_alive || '10m',
+        options: {
+          ...inferenceOptions,
+          ...req.body?.options,  // Allow client overrides
+        },
+      };
     }
-
-    const body = {
-      model: modelStr,
-      system: isRaw ? undefined : systemPrompt,
-      prompt: formattedPrompt,
-      raw: isRaw,
-      stream: req.body?.stream !== false,
-      keep_alive: req.body?.keep_alive || '10m',
-      options: {
-        ...inferenceOptions,
-        ...req.body?.options,  // Allow client overrides
-      },
-    };
 
     // ========== OPTIMIZATION 4: Add request timeout ==========
     const controller = new AbortController();
@@ -262,7 +295,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
       if (outPolicy.blocked) return res.status(400).json(policyMessage(outPolicy, 'output'));
       
       // ========== OPTIMIZATION 5: Cache successful response ==========
-      if (data?.response) {
+      if (canUsePromptCache && data?.response) {
         responseCache.set(userPrompt, data.response);
         data.cached = false;
       }
@@ -272,7 +305,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Cache', 'MISS');
+    res.setHeader('X-Cache', canUsePromptCache ? 'MISS' : 'BYPASS');
     res.setHeader('X-Inference-Profile', profile);
 
     const reader = r.body.getReader();
@@ -314,7 +347,9 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
                 done: true,
               };
               res.write(`${JSON.stringify(blockedChunk)}\n`);
-              responseCache.set(userPrompt, '[Blocked by safety policy]');  // Cache blocked response too
+              if (canUsePromptCache) {
+                responseCache.set(userPrompt, '[Blocked by safety policy]');  // Cache blocked response too
+              }
               return res.end();
             }
           }
@@ -325,7 +360,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
     }
 
     // ========== Cache final response after completion ==========
-    if (accumulated) {
+    if (canUsePromptCache && accumulated) {
       responseCache.set(userPrompt, accumulated);
     }
 
@@ -333,7 +368,7 @@ app.post('/api/proxy/ollama/chat', policyGuard, async (req, res) => {
   } catch (err) {
     const isTimeout = err?.name === 'AbortError';
     const statusCode = isTimeout ? 504 : 500;
-    const errorMsg = isTimeout ? 'Inference timeout (>25s)' : err?.message || 'Ollama proxy failure';
+    const errorMsg = isTimeout ? 'Inference timeout (>5m)' : err?.message || 'Ollama proxy failure';
     res.status(statusCode).json({ error: errorMsg, timeout: isTimeout });
   }
 });
@@ -440,6 +475,7 @@ app.post('/api/proxy/azure/chat', policyGuard, async (req, res) => {
 
 const server = app.listen(PORT, () => {
   console.log(`[proxy] running on http://localhost:${PORT}`);
+  console.log(`[proxy] cors origins: ${allowedOrigins.length === 0 || allowedOrigins.includes('*') ? 'allow-all' : allowedOrigins.join(', ')}`);
   console.log(`[cache] initialized: ${responseCache.getStats().maxSize} entries, 1-hour TTL`);
   console.log(`[optimization] inference profiles enabled: fast/balanced/thorough`);
 });

@@ -82,7 +82,10 @@ npm install
 ### Configure Environment 
 1. Copy `.env.example` to `.env`
 2. Apply your targeted keys (`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`, etc.)
-3. Add `VITE_LOCAL_VAULT_KEY` if you wish to enforce client-side UI encryption.
+3. For split deployments, set:
+  - `VITE_API_BASE_URL=https://YOUR_BACKEND_DOMAIN`
+  - `CORS_ORIGIN=https://YOUR_GITHUB_USERNAME.github.io`
+4. Add `VITE_LOCAL_VAULT_KEY` if you wish to enforce client-side UI encryption.
 
 ### Run (Development / Full Stack)
 ```bash
@@ -90,12 +93,37 @@ npm run dev:full
 ```
 *Spins up Vite Frontend (localhost:5173) and Node Proxy Backend (localhost:8787).*
 
+### Run Separately (Backend and Web)
+Backend only:
+```bash
+npm run dev:backend
+```
+
+Web only:
+```bash
+npm run dev:web
+```
+
+The web app can run independently as long as `VITE_API_BASE_URL` points to a reachable backend.
+
 ### Build (Production)
 ```bash
 npm run build
 npm run preview
 ```
 Deploy the `dist/` directory directly to GitHub Pages, Vercel, or any standard static infrastructure.
+
+### GitHub Pages Frontend + Separate Backend
+1. Deploy backend (`server/proxy.js`) to a Node host (Render/Railway/Azure/etc.) with your server-side env vars.
+2. Set backend CORS to your Pages domain:
+  - `CORS_ORIGIN=https://YOUR_GITHUB_USERNAME.github.io`
+3. In GitHub repository settings, add secret:
+  - `VITE_API_BASE_URL=https://YOUR_BACKEND_DOMAIN`
+4. Build for Pages locally (optional verification):
+```bash
+npm run build:pages
+```
+5. Push to `main`. The included workflow at `.github/workflows/deploy-pages.yml` publishes frontend to GitHub Pages.
 
 ---
 

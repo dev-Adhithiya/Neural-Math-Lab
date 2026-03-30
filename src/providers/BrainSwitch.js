@@ -12,15 +12,19 @@
  * For production, proxy requests via a backend and use managed identity / server-side secrets.
  */
 
+import { API_PATHS, getDefaultOllamaProxyUrl, withApiBase } from '../config/api.js';
+
 const DEFAULTS = {
   azureApiVersion: '2024-02-01',
   maxTokens: 16384,
   temperature: 0.7,
 
   // Local (Ollama)
-  ollamaUrl: 'http://localhost:11434/api/generate',
+  ollamaUrl: getDefaultOllamaProxyUrl(),
   ollamaModel: 'deepseek-r1:7b',
 };
+
+const OLLAMA_DIRECT_FALLBACK_URL = 'http://localhost:11434/api/generate';
 
 export class BrainSwitch {
   /**
@@ -186,14 +190,24 @@ export class BrainSwitch {
       ? `You are a helpful math tutor.\n\nGROUNDING CONTEXT (from math_textbook.pdf via Azure AI Search):\n${rag.context}\n\nUse the context when relevant; if it doesn't apply, ignore it.`
       : 'You are a helpful math tutor.';
 
+    const normalizeImageUrl = (imageValue) => {
+      const raw = String(imageValue || '').trim();
+      if (!raw) return '';
+      if (/^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(raw)) {
+        return raw;
+      }
+      return `data:image/jpeg;base64,${raw}`;
+    };
+
     if (imageBase64) {
+      const imageUrl = normalizeImageUrl(imageBase64);
       return [
         { role: 'system', content: system },
         {
           role: 'user',
           content: [
             { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+            { type: 'image_url', image_url: { url: imageUrl } },
           ],
         },
       ];
@@ -229,7 +243,7 @@ export class BrainSwitch {
   async _tryRag(query) {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
 
-    const res = await fetch('/api/proxy/rag/search', {
+    const res = await fetch(withApiBase(API_PATHS.ragSearch), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -258,7 +272,7 @@ export class BrainSwitch {
     const temperature = opts?.generation?.temperature ?? opts.temperature ?? this.config.temperature;
 
     this.abortController = new AbortController();
-    const res = await fetch('/api/proxy/azure/chat', {
+    const res = await fetch(withApiBase(API_PATHS.azureChat), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -281,7 +295,7 @@ export class BrainSwitch {
   }
 
   async _azureNonStreaming(messages) {
-    const res = await fetch('/api/proxy/azure/chat', {
+    const res = await fetch(withApiBase(API_PATHS.azureChat), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -339,7 +353,16 @@ export class BrainSwitch {
   /* ───────────────────────── Local (Ollama) ───────────────────────── */
 
   async *_streamOllama(prompt, opts) {
-    const directUrl = this.config.ollamaUrl || DEFAULTS.ollamaUrl;
+    const configuredUrl = this.config.ollamaUrl || DEFAULTS.ollamaUrl;
+    const proxyUrl = withApiBase(API_PATHS.ollamaChat);
+    const isSameOriginProxyPath = (url) => {
+      const value = String(url || '').trim().toLowerCase();
+      if (!value.startsWith('/')) return false;
+      return /^\/api\/proxy\/ollama\/chat(?:$|[/?#])/i.test(value);
+    };
+    const directUrl = isSameOriginProxyPath(configuredUrl)
+      ? OLLAMA_DIRECT_FALLBACK_URL
+      : configuredUrl;
     const model = this.config.ollamaModel || DEFAULTS.ollamaModel;
     const maxTokens = opts?.generation?.maxTokens ?? opts.maxTokens ?? this.config.maxTokens;
     const payload = {
@@ -376,7 +399,7 @@ export class BrainSwitch {
 
       if (!res.ok) {
         const rawText = await res.text();
-        if (isProxyAttempt && (res.status >= 500 || shouldFallbackFromProxyError(rawText))) {
+        if (isProxyAttempt && (res.status >= 500 || shouldFallbackFromProxyError(rawText)) && url !== directUrl) {
           // Proxy is down/unreachable: try talking to local Ollama directly.
           return doRequest(directUrl, false);
         }
@@ -412,10 +435,10 @@ export class BrainSwitch {
 
     let res;
     try {
-      res = await doRequest('/api/proxy/ollama/chat', true);
+      res = await doRequest(proxyUrl, true);
     } catch (err) {
       // If proxy route itself is unreachable in dev, try direct Ollama URL.
-      if (shouldFallbackFromProxyError(err?.message || '')) {
+      if (shouldFallbackFromProxyError(err?.message || '') && directUrl !== proxyUrl) {
         res = await doRequest(directUrl, false);
       } else {
         throw err;
